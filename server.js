@@ -555,62 +555,86 @@ async function resolveStream(matchLink) {
 
   const headers = { 'User-Agent': UA, 'Accept-Language': 'ar,en;q=0.9', Referer: 'https://sir-tv.vip/' };
 
-  const wantedId = (matchLink.match(/[?&]m=(\d+)/) || [])[1] || null;
+  // m هو رقم الماتش الصح (والبث) — أي رقم تاني في أي iframe بنعتبره غلط ونصححه
+  const mId = (matchLink.match(/[?&]m=(\d+)/) || [])[1] || null;
+  const pId = (matchLink.match(/[?&]p=(\d+)/) || [])[1] || null;
+  const ids = mId ? [mId] : [];
 
-  const page1 = await get(matchLink, { headers }, 1);
-  let playerUrl = extractPlayerUrl(page1.data, matchLink, wantedId);
-  if (!playerUrl && wantedId) playerUrl = `https://n1.sirftv.com/hard/player.html?match=${wantedId}`;
-  if (!playerUrl) throw new Error('Player page not found');
-  playerUrl = pinMatchId(playerUrl, wantedId);
+  const candidates = [];
+  const addCand = u => { if (u && !candidates.includes(u)) candidates.push(u); };
 
-  const page2 = await get(playerUrl, { headers: { ...headers, Referer: matchLink } }, 1);
-  let streams = extractStreams(page2.data, wantedId);
-  if (streams.length) {
-    const result = buildResult(streams, playerUrl);
-    streamCache.set(matchLink, { ts: Date.now(), data: result });
-    return result;
+  // 1) أول مرشح: البلاير المبني مباشرة برقم الماتش الصح
+  if (mId) addCand(`https://n1.sirftv.com/hard/player.html?match=${mId}`);
+
+  // 2) البلاير اللي في صفحة الماتش — مع تصحيح رقم الماتش لو مختلف
+  try {
+    const page1 = await get(matchLink, { headers }, 1);
+    const direct = extractStreams(page1.data, ids);
+    if (direct.length) {
+      const result = buildResult(direct, matchLink);
+      streamCache.set(matchLink, { ts: Date.now(), data: result });
+      return result;
+    }
+    addCand(fixMatchParam(extractPlayerUrl(page1.data, matchLink, ids), mId));
+  } catch (e) {
+    console.error('[Stream] page1 failed:', e.message);
   }
+
+  // 3) آخر محاولة: نفس البلاير بـ p كرقم
+  if (pId) addCand(`https://n1.sirftv.com/hard/player.html?match=${pId}`);
+
+  const errors = [];
+  for (const playerUrl of candidates) {
+    try {
+      const result = await resolveFromPlayer(playerUrl, matchLink, headers, ids);
+      console.log('[Stream] OK via', playerUrl);
+      streamCache.set(matchLink, { ts: Date.now(), data: result });
+      return result;
+    } catch (e) {
+      console.error('[Stream] candidate failed:', playerUrl, '-', e.message);
+      errors.push(`${playerUrl} → ${e.message}`);
+    }
+  }
+  throw new Error('No working stream. Tried: ' + (errors.join(' | ') || 'no player url found'));
+}
+
+// لو لينك البلاير فيه match/m/id برقم مختلف عن رقم الماتش الصح، بنستبدله
+function fixMatchParam(url, id) {
+  if (!url || !id) return url;
+  try {
+    const u = new URL(url);
+    for (const k of ['match', 'm', 'match_id', 'id']) {
+      if (u.searchParams.has(k) && /^\d+$/.test(u.searchParams.get(k))) u.searchParams.set(k, id);
+    }
+    return u.href;
+  } catch (_) { return url; }
+}
+
+async function resolveFromPlayer(playerUrl, matchLink, headers, ids) {
+  const page2 = await get(playerUrl, { headers: { ...headers, Referer: matchLink } }, 1);
+  let streams = extractStreams(page2.data, ids);
+  if (streams.length) return buildResult(streams, playerUrl);
 
   let finalPlayer = extractFinalPlayer(page2.data, playerUrl);
   if (!finalPlayer) throw new Error('Final player not found');
   if (!finalPlayer.startsWith('http')) finalPlayer = new URL(finalPlayer, playerUrl).href;
-  finalPlayer = pinMatchId(finalPlayer, wantedId);
 
   const page3 = await get(finalPlayer, { headers: { ...headers, Referer: playerUrl } }, 1);
-  streams = extractStreams(page3.data, wantedId);
+  streams = extractStreams(page3.data, ids);
   if (!streams.length) throw new Error('No stream URL found');
-
-  const result = buildResult(streams, finalPlayer);
-  streamCache.set(matchLink, { ts: Date.now(), data: result });
-  return result;
+  return buildResult(streams, finalPlayer);
 }
 
 const AD_IFRAME = /doubleclick|googlesyndication|adsterra|popads|propeller|facebook\.com|youtube\.com|disqus/i;
 
-// يثبّت رقم الماتش في أي لينك (match= / m= / id=) على الرقم الصح اللي جاي من اللينك الأصلي
-function pinMatchId(url, id) {
-  if (!id || !url) return url;
-  try {
-    const u = new URL(url);
-    let touched = false;
-    for (const k of ['match', 'm', 'id', 'match_id']) {
-      if (u.searchParams.has(k) && /^\d+$/.test(u.searchParams.get(k)) && u.searchParams.get(k) !== id) {
-        u.searchParams.set(k, id);
-        touched = true;
-      }
-    }
-    return touched ? u.href : url;
-  } catch (_) { return url; }
-}
-
-function extractPlayerUrl(html, base, id) {
+function extractPlayerUrl(html, base, ids = []) {
   const $ = cheerio.load(html);
   const srcs = $('iframe').map((_, el) => $(el).attr('src') || $(el).attr('data-src') || '').get()
     .filter(Boolean)
     .map(src => { try { return src.startsWith('http') ? src : new URL(src, base).href; } catch (_) { return null; } })
     .filter(u => u && !AD_IFRAME.test(u));
   const pick =
-    (id && srcs.find(u => u.includes(id))) ||
+    srcs.find(u => ids.some(i => u.includes(i))) ||
     srcs.find(u => /sirftv|playerv|player/i.test(u)) ||
     srcs[0];
   if (pick) return pick;
@@ -626,7 +650,7 @@ function extractFinalPlayer(html, base) {
   return m ? m[0] : null;
 }
 
-function extractStreams(html, id) {
+function extractStreams(html, ids = []) {
   const set = new Set();
   const patterns = [
     /https?:\/\/[a-z0-9.-]+\.live--koora\.com\/[^\s"'<>]+/gi,
@@ -636,8 +660,8 @@ function extractStreams(html, id) {
   for (const re of patterns) (html.match(re) || []).forEach(u => set.add(u.replace(/\\$/, '')));
   const all = [...set];
   // لو الصفحة فيها ستريمات لأكتر من ماتش، خد بس اللي فيها رقم الماتش المطلوب
-  if (id) {
-    const own = all.filter(u => u.includes(id));
+  if (ids.length) {
+    const own = all.filter(u => ids.some(i => u.includes(i)));
     if (own.length) return own;
   }
   return all;
@@ -1221,7 +1245,8 @@ app.get('/api/stream', async (req, res) => {
     const playUrl = `${host}/proxy?url=${encodeURIComponent(result.streamUrl)}&ref=${ref}`;
     res.json({
       success: true, playUrl, qualities, quality: result.quality,
-      type: 'hls', proxied: true, resolvedAt: result.resolvedAt
+      type: 'hls', proxied: true, resolvedAt: result.resolvedAt,
+      debug: { link, player: result.referer, rawStream: result.streamUrl }
     });
   } catch (e) {
     console.error('[Stream]', e.message);
