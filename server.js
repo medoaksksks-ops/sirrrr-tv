@@ -1,5 +1,5 @@
 /**
- * Sir TV Live Server v3.3 — Rich details + stable streams
+ * Sir TV Live Server v3.4 — Rich details + stable streams
  */
 const express = require('express');
 const http = require('http');
@@ -55,7 +55,7 @@ const io = new Server(server, { cors: { origin: true }, pingInterval: 20000, pin
 let cache = {
   matches: [], live: [], finished: [], upcoming: [],
   counts: { total: 0, live: 0, finished: 0, upcoming: 0 },
-  lastUpdate: null, error: null, version: '3.3'
+  lastUpdate: null, error: null, version: '3.4'
 };
 
 const detailsCache = new Map();
@@ -132,7 +132,7 @@ async function fetchMatches() {
     cache = {
       matches, live, finished, upcoming,
       counts: { total: matches.length, live: live.length, finished: finished.length, upcoming: upcoming.length },
-      lastUpdate: new Date().toISOString(), error: null, version: '3.3'
+      lastUpdate: new Date().toISOString(), error: null, version: '3.4'
     };
     console.log(`[Scraper] total=${matches.length} live=${live.length}`);
     return cache;
@@ -648,6 +648,7 @@ const leagueCache = new Map();
 const LEAGUE_TTL = 5 * 60 * 1000;
 
 const LEAGUES = [
+  { id: 519, name: 'Egyptian Premier League', nameAr: 'الدوري المصري', country: 'Egypt', type: 'league' },
   { id: 47, name: 'Premier League', nameAr: 'الدوري الإنجليزي', country: 'England', type: 'league' },
   { id: 87, name: 'LaLiga', nameAr: 'الدوري الإسباني', country: 'Spain', type: 'league' },
   { id: 55, name: 'Serie A', nameAr: 'الدوري الإيطالي', country: 'Italy', type: 'league' },
@@ -655,11 +656,8 @@ const LEAGUES = [
   { id: 53, name: 'Ligue 1', nameAr: 'الدوري الفرنسي', country: 'France', type: 'league' },
   { id: 42, name: 'Champions League', nameAr: 'دوري أبطال أوروبا', country: 'Europe', type: 'cup' },
   { id: 73, name: 'Europa League', nameAr: 'الدوري الأوروبي', country: 'Europe', type: 'cup' },
-  { id: 57, name: 'Eredivisie', nameAr: 'الدوري الهولندي', country: 'Netherlands', type: 'league' },
-  { id: 61, name: 'Liga Portugal', nameAr: 'الدوري البرتغالي', country: 'Portugal', type: 'league' },
-  { id: 71, name: 'Saudi Pro League', nameAr: 'الدوري السعودي', country: 'Saudi Arabia', type: 'league' },
-  { id: 46, name: 'Championship', nameAr: 'الشنبونة الإنجليزية', country: 'England', type: 'league' },
-  { id: 130, name: 'MLS', nameAr: 'الدوري الأمريكي', country: 'USA', type: 'league' }
+  { id: 526, name: 'CAF Champions League', nameAr: 'دوري أبطال أفريقيا', country: 'Africa', type: 'cup' },
+  { id: 9468, name: 'CAF Confederation Cup', nameAr: 'كأس الكونفدرالية الأفريقية', country: 'Africa', type: 'cup' }
 ];
 
 function mapTableRows(rows) {
@@ -712,21 +710,22 @@ function mapScorers(playersStats) {
   if (!Array.isArray(playersStats)) return [];
   const goals = playersStats.find(p => p.name === 'goals' || /top scorer/i.test(p.header || ''));
   if (!goals) return [];
-  // Prefer full list URL later; use topThree + participant as seed
   const list = [];
   const seen = new Set();
   const push = (p) => {
-    if (!p || !p.id || seen.has(p.id)) return;
-    seen.add(p.id);
+    if (!p) return;
+    const id = p.id || p.ParticiantId || p.ParticipantId;
+    if (!id || seen.has(id)) return;
+    seen.add(id);
     list.push({
-      id: p.id,
-      rank: p.rank ?? list.length + 1,
-      name: p.name,
-      teamId: p.teamId,
-      teamName: p.teamName,
-      goals: p.value ?? p.stat?.value ?? null,
-      photo: fotmobPhoto(p.id),
-      teamLogo: p.teamId ? `https://images.fotmob.com/image_resources/logo/teamlogo/${p.teamId}_small.png` : null
+      id,
+      rank: p.rank ?? p.Rank ?? list.length + 1,
+      name: p.name || p.ParticipantName,
+      teamId: p.teamId || p.TeamId,
+      teamName: p.teamName || p.TeamName,
+      goals: p.value ?? p.StatValue ?? p.stat?.value ?? null,
+      photo: fotmobPhoto(id),
+      teamLogo: (p.teamId || p.TeamId) ? `https://images.fotmob.com/image_resources/logo/teamlogo/${p.teamId || p.TeamId}_small.png` : null
     });
   };
   (goals.topThree || []).forEach(push);
@@ -734,51 +733,48 @@ function mapScorers(playersStats) {
   return list;
 }
 
-// يلاقي أول مصفوفة لاعبين جوه أي شكل رد (Array / TopLists[].StatList / statsList ...)
-function findStatRows(node, depth = 0) {
-  if (!node || depth > 4) return null;
-  if (Array.isArray(node)) {
-    if (node.length && node[0] && typeof node[0] === 'object' &&
-        (node[0].ParticipantName != null || node[0].name != null || node[0].participantName != null)) return node;
-    for (const x of node) { const r = findStatRows(x, depth + 1); if (r) return r; }
-    return null;
-  }
-  if (typeof node === 'object') {
-    for (const k of ['StatList', 'statList', 'TopLists', 'topLists', 'statsList', 'players']) {
-      if (node[k]) { const r = findStatRows(node[k], depth + 1); if (r) return r; }
-    }
-  }
-  return null;
-}
-
-function mapStatRow(p, i, field) {
-  const teamId = p.TeamId ?? p.teamId ?? null;
-  const id = p.ParticipantId ?? p.participantId ?? p.id ?? null;
-  const val = p.StatValue ?? p.statValue ?? p.value ?? p.stat?.value ?? null;
-  return {
-    id,
-    rank: p.Rank ?? p.rank ?? i + 1,
-    name: p.ParticipantName ?? p.participantName ?? p.name ?? '',
-    teamId,
-    teamName: p.TeamName ?? p.teamName ?? '',
-    [field]: val,
-    photo: fotmobPhoto(id),
-    teamLogo: teamId ? `https://images.fotmob.com/image_resources/logo/teamlogo/${teamId}_small.png` : null
-  };
-}
-
-async function fetchFullStat(fetchAllUrl, field) {
+async function fetchFullScorers(fetchAllUrl) {
   if (!fetchAllUrl) return [];
   try {
-    const { data } = await get(fetchAllUrl, {
-      headers: { 'User-Agent': UA, Accept: 'application/json', Referer: 'https://www.fotmob.com/' },
-      timeout: 12000
-    }, 1);
-    const rows = findStatRows(data);
-    if (!rows) { console.error('[Stat full] unknown shape for', fetchAllUrl); return []; }
-    return rows.map((p, i) => mapStatRow(p, i, field)).filter(x => x.name).slice(0, 30);
+    const { data } = await axios.get(fetchAllUrl, {
+      headers: {
+        'User-Agent': UA,
+        Accept: 'application/json,text/plain,*/*',
+        'Accept-Encoding': 'gzip, deflate',
+        Referer: 'https://www.fotmob.com/'
+      },
+      timeout: 14000,
+      decompress: true,
+      validateStatus: s => s < 500
+    });
+
+    let list = [];
+    if (Array.isArray(data)) {
+      list = data;
+    } else if (data && Array.isArray(data.TopLists) && data.TopLists[0]) {
+      list = data.TopLists[0].StatList || [];
+    } else if (data && Array.isArray(data.statsList)) {
+      list = data.statsList;
+    } else if (data && Array.isArray(data.players)) {
+      list = data.players;
+    }
+
+    return (list || []).slice(0, 30).map((p, i) => {
+      const id = p.ParticiantId || p.ParticipantId || p.id || p.playerId;
+      const teamId = p.TeamId || p.teamId;
+      return {
+        id,
+        rank: p.Rank ?? p.rank ?? i + 1,
+        name: p.ParticipantName || p.ParticiantName || p.name || p.playerName,
+        teamId,
+        teamName: p.TeamName || p.teamName,
+        goals: p.StatValue ?? p.value ?? p.stat?.value ?? null,
+        photo: fotmobPhoto(id),
+        teamLogo: teamId ? `https://images.fotmob.com/image_resources/logo/teamlogo/${teamId}_small.png` : null
+      };
+    }).filter(p => p.name);
   } catch (e) {
-    console.error('[Stat full]', e.message);
+    console.error('[Scorers full]', e.message);
     return [];
   }
 }
@@ -805,30 +801,29 @@ async function fetchLeagueDetails(leagueId) {
     fixtures = mapFixtures(data.fixtures?.allMatches || []);
   } catch (_) {}
 
-  // scorers + assists (الأعلى 30 من الرابط الكامل، وإلا أفضل 3 من الصفحة)
-  const players = data.stats?.players || [];
-  const goalsBlock = players.find(p => p.name === 'goals' || /top scorer|goals/i.test(p.header || ''));
-  const assistBlock = players.find(p => p.name === 'goal_assist' || /assist/i.test(p.header || ''));
-
-  let scorers = mapScorers(players);
+  // scorers
+  let scorers = mapScorers(data.stats?.players || []);
+  const goalsBlock = (data.stats?.players || []).find(p => p.name === 'goals' || /top scorer/i.test(p.header || ''));
   if (goalsBlock?.fetchAllUrl) {
-    const full = await fetchFullStat(goalsBlock.fetchAllUrl, 'goals');
+    const full = await fetchFullScorers(goalsBlock.fetchAllUrl);
     if (full.length) scorers = full;
   }
 
+  // also assists top 3
   let assists = [];
-  if (assistBlock) {
-    assists = (assistBlock.topThree || []).map((p, i) => ({
-      id: p.id, rank: p.rank ?? i + 1, name: p.name, teamId: p.teamId, teamName: p.teamName,
-      assists: p.value, photo: fotmobPhoto(p.id),
+  const ass = (data.stats?.players || []).find(p => p.name === 'goal_assist' || /assist/i.test(p.header || ''));
+  if (ass) {
+    assists = (ass.topThree || []).map((p, i) => ({
+      id: p.id,
+      rank: p.rank ?? i + 1,
+      name: p.name,
+      teamId: p.teamId,
+      teamName: p.teamName,
+      assists: p.value,
+      photo: fotmobPhoto(p.id),
       teamLogo: p.teamId ? `https://images.fotmob.com/image_resources/logo/teamlogo/${p.teamId}_small.png` : null
     }));
-    if (assistBlock.fetchAllUrl) {
-      const full = await fetchFullStat(assistBlock.fetchAllUrl, 'assists');
-      if (full.length) assists = full;
-    }
   }
-  console.log(`[League ${id}] standings=${standings.length} scorers=${scorers.length} assists=${assists.length} fixtures=${fixtures.length}`);
 
   const meta = LEAGUES.find(l => l.id === id) || {};
   const result = {
@@ -953,7 +948,7 @@ app.get('/proxy', async (req, res) => {
 
 app.get('/health', (req, res) => {
   res.json({
-    status: 'ok', version: '3.3', uptime: process.uptime(),
+    status: 'ok', version: '3.4', uptime: process.uptime(),
     lastUpdate: cache.lastUpdate, counts: cache.counts,
     caches: { details: detailsCache.size, streams: streamCache.size }
   });
@@ -961,7 +956,7 @@ app.get('/health', (req, res) => {
 
 app.get('/', (req, res) => {
   res.json({
-    name: 'Sir TV Live Server', version: '3.3', status: 'running',
+    name: 'Sir TV Live Server', version: '3.4', status: 'running',
     features: ['matches', 'leagues', 'standings', 'scorers', 'fixtures', 'rich-details-fotmob', 'full-hls-proxy'],
     endpoints: {
       matches: 'GET /api/matches',
@@ -995,6 +990,6 @@ async function boot() {
 boot().catch(console.error);
 
 server.listen(PORT, () => {
-  console.log(`\n🔥 Sir TV Live v3.3 — port ${PORT}`);
+  console.log(`\n🔥 Sir TV Live v3.4 — port ${PORT}`);
   console.log(`   Rich details (FotMob) | Lineups | Events | Full proxy\n`);
 });
