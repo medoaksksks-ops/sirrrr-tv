@@ -555,16 +555,16 @@ async function resolveStream(matchLink) {
 
   const headers = { 'User-Agent': UA, 'Accept-Language': 'ar,en;q=0.9', Referer: 'https://sir-tv.vip/' };
 
+  const wantedId = (matchLink.match(/[?&]m=(\d+)/) || [])[1] || null;
+
   const page1 = await get(matchLink, { headers }, 1);
-  let playerUrl = extractPlayerUrl(page1.data, matchLink);
-  if (!playerUrl) {
-    const mid = matchLink.match(/[?&]m=(\d+)/);
-    if (mid) playerUrl = `https://n1.sirftv.com/hard/player.html?match=${mid[1]}`;
-  }
+  let playerUrl = extractPlayerUrl(page1.data, matchLink, wantedId);
+  if (!playerUrl && wantedId) playerUrl = `https://n1.sirftv.com/hard/player.html?match=${wantedId}`;
   if (!playerUrl) throw new Error('Player page not found');
+  playerUrl = pinMatchId(playerUrl, wantedId);
 
   const page2 = await get(playerUrl, { headers: { ...headers, Referer: matchLink } }, 1);
-  let streams = extractStreams(page2.data);
+  let streams = extractStreams(page2.data, wantedId);
   if (streams.length) {
     const result = buildResult(streams, playerUrl);
     streamCache.set(matchLink, { ts: Date.now(), data: result });
@@ -574,9 +574,10 @@ async function resolveStream(matchLink) {
   let finalPlayer = extractFinalPlayer(page2.data, playerUrl);
   if (!finalPlayer) throw new Error('Final player not found');
   if (!finalPlayer.startsWith('http')) finalPlayer = new URL(finalPlayer, playerUrl).href;
+  finalPlayer = pinMatchId(finalPlayer, wantedId);
 
   const page3 = await get(finalPlayer, { headers: { ...headers, Referer: playerUrl } }, 1);
-  streams = extractStreams(page3.data);
+  streams = extractStreams(page3.data, wantedId);
   if (!streams.length) throw new Error('No stream URL found');
 
   const result = buildResult(streams, finalPlayer);
@@ -584,10 +585,35 @@ async function resolveStream(matchLink) {
   return result;
 }
 
-function extractPlayerUrl(html, base) {
+const AD_IFRAME = /doubleclick|googlesyndication|adsterra|popads|propeller|facebook\.com|youtube\.com|disqus/i;
+
+// يثبّت رقم الماتش في أي لينك (match= / m= / id=) على الرقم الصح اللي جاي من اللينك الأصلي
+function pinMatchId(url, id) {
+  if (!id || !url) return url;
+  try {
+    const u = new URL(url);
+    let touched = false;
+    for (const k of ['match', 'm', 'id', 'match_id']) {
+      if (u.searchParams.has(k) && /^\d+$/.test(u.searchParams.get(k)) && u.searchParams.get(k) !== id) {
+        u.searchParams.set(k, id);
+        touched = true;
+      }
+    }
+    return touched ? u.href : url;
+  } catch (_) { return url; }
+}
+
+function extractPlayerUrl(html, base, id) {
   const $ = cheerio.load(html);
-  const iframe = $('iframe#player, iframe[src*="sirftv"], iframe[src*="playerv"], iframe[src*="player"], iframe').first().attr('src');
-  if (iframe) return iframe.startsWith('http') ? iframe : new URL(iframe, base).href;
+  const srcs = $('iframe').map((_, el) => $(el).attr('src') || $(el).attr('data-src') || '').get()
+    .filter(Boolean)
+    .map(src => { try { return src.startsWith('http') ? src : new URL(src, base).href; } catch (_) { return null; } })
+    .filter(u => u && !AD_IFRAME.test(u));
+  const pick =
+    (id && srcs.find(u => u.includes(id))) ||
+    srcs.find(u => /sirftv|playerv|player/i.test(u)) ||
+    srcs[0];
+  if (pick) return pick;
   const m = html.match(/https?:\/\/[^"'\s]+sirftv\.com[^"'\s]*/i);
   return m ? m[0] : null;
 }
@@ -600,7 +626,7 @@ function extractFinalPlayer(html, base) {
   return m ? m[0] : null;
 }
 
-function extractStreams(html) {
+function extractStreams(html, id) {
   const set = new Set();
   const patterns = [
     /https?:\/\/[a-z0-9.-]+\.live--koora\.com\/[^\s"'<>]+/gi,
@@ -608,7 +634,13 @@ function extractStreams(html) {
     /https?:\/\/[^"'\s]+\.m3u8[^"'\s]*/gi
   ];
   for (const re of patterns) (html.match(re) || []).forEach(u => set.add(u.replace(/\\$/, '')));
-  return [...set];
+  const all = [...set];
+  // لو الصفحة فيها ستريمات لأكتر من ماتش، خد بس اللي فيها رقم الماتش المطلوب
+  if (id) {
+    const own = all.filter(u => u.includes(id));
+    if (own.length) return own;
+  }
+  return all;
 }
 
 function buildResult(streams, referer) {
