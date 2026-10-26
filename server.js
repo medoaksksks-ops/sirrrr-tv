@@ -1,5 +1,5 @@
 /**
- * Sir TV Live Server v3.1 — Rich details + stable streams
+ * Sir TV Live Server v3.2 — Rich details + stable streams
  */
 const express = require('express');
 const http = require('http');
@@ -61,7 +61,90 @@ let cache = {
 const detailsCache = new Map();
 const streamCache = new Map();
 const DETAILS_TTL = 90 * 1000;
+
 const STREAM_TTL = 45 * 1000;
+
+function to12Hour(timeStr) {
+  if (!timeStr) return '';
+  if (/[صم]|am|pm/i.test(timeStr)) return timeStr;
+  const m = String(timeStr).trim().match(/^(\d{1,2}):(\d{2})$/);
+  if (!m) return timeStr;
+  let h = parseInt(m[1], 10);
+  const min = m[2];
+  const period = h >= 12 ? 'م' : 'ص';
+  if (h === 0) h = 12;
+  else if (h > 12) h -= 12;
+  return `${h}:${min} ${period}`;
+}
+
+// ========== MATCHES SCRAPER ==========
+async function fetchMatches() {
+  try {
+    const { data } = await get(SOURCE, { headers: { Referer: SOURCE, 'Cache-Control': 'no-cache' } });
+    const $ = cheerio.load(data);
+    const matches = [];
+
+    $('.AY_Match').each((_, el) => {
+      const $el = $(el);
+      const id = ($el.attr('id') || '').replace(/^m-/, '') || null;
+      let link = $el.find('a').attr('href') || null;
+      if (link && !link.startsWith('http')) link = new URL(link, SOURCE).href;
+
+      const home = $el.find('.TM1 .TM_Name').text().trim();
+      const away = $el.find('.TM2 .TM_Name').text().trim();
+      const homeLogo = $el.find('.TM1 img').attr('src') || null;
+      const awayLogo = $el.find('.TM2 img').attr('src') || null;
+      const score = $el.find('.MT_Result').text().replace(/\s+/g, ' ').trim() || 'vs';
+      const statusText = $el.find('.MT_Stat').text().trim();
+      const timeRaw = $el.find('.MT_Time span, .MT_Time').first().text().trim();
+      const isLiveClass = $el.hasClass('live') || $el.hasClass('now');
+      const start = $el.attr('data-start') || null;
+
+      let externalId = null;
+      if (link) {
+        const mm = link.match(/[?&]m=(\d+)/);
+        if (mm) externalId = mm[1];
+      }
+
+      let statusType = 'upcoming';
+      const s = (statusText || '').toLowerCase();
+      if (isLiveClass || /مباشر|live|شوط|دقيقة|توقف/.test(s)) statusType = 'live';
+      else if (/انتهت|انتهى|ft|نهاية/.test(s)) statusType = 'finished';
+
+      const hasStream = !!(link && (link.includes('korat') || link.includes('hes-goals') || /[?&]m=\d+/.test(link) || link.includes('watch-')));
+
+      if (home && away) {
+        matches.push({
+          id, externalId, home, away, homeLogo, awayLogo, score,
+          status: statusText || (statusType === 'live' ? 'مباشر' : statusType === 'finished' ? 'انتهت' : 'لم تبدأ'),
+          statusType, time: to12Hour(timeRaw), timeRaw: timeRaw || null,
+          isLive: statusType === 'live', start, link, hasStream
+        });
+      }
+    });
+
+    const order = { live: 0, upcoming: 1, finished: 2 };
+    matches.sort((a, b) => (order[a.statusType] ?? 3) - (order[b.statusType] ?? 3));
+    const live = matches.filter(m => m.statusType === 'live');
+    const finished = matches.filter(m => m.statusType === 'finished');
+    const upcoming = matches.filter(m => m.statusType === 'upcoming');
+
+    cache = {
+      matches, live, finished, upcoming,
+      counts: { total: matches.length, live: live.length, finished: finished.length, upcoming: upcoming.length },
+      lastUpdate: new Date().toISOString(), error: null, version: '3.2'
+    };
+    console.log(`[Scraper] total=${matches.length} live=${live.length}`);
+    return cache;
+  } catch (err) {
+    console.error('[Scraper]', err.message);
+    cache.error = err.message;
+    cache.lastUpdate = new Date().toISOString();
+    return cache;
+  }
+}
+
+
 
 
 function emptyDetails() {
@@ -658,5 +741,5 @@ boot().catch(console.error);
 
 server.listen(PORT, () => {
   console.log(`\n🔥 Sir TV Live v3.2 — port ${PORT}`);
-  console.log(`   Rich details (SportScore) | Lineups | Events | Full proxy\n`);
+  console.log(`   Rich details (FotMob) | Lineups | Events | Full proxy\n`);
 });
