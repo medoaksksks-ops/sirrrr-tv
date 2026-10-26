@@ -1,5 +1,5 @@
 /**
- * Sir TV Live Server v3.2 — Rich details + stable streams
+ * Sir TV Live Server v3.3 — Rich details + stable streams
  */
 const express = require('express');
 const http = require('http');
@@ -55,7 +55,7 @@ const io = new Server(server, { cors: { origin: true }, pingInterval: 20000, pin
 let cache = {
   matches: [], live: [], finished: [], upcoming: [],
   counts: { total: 0, live: 0, finished: 0, upcoming: 0 },
-  lastUpdate: null, error: null, version: '3.2'
+  lastUpdate: null, error: null, version: '3.3'
 };
 
 const detailsCache = new Map();
@@ -132,7 +132,7 @@ async function fetchMatches() {
     cache = {
       matches, live, finished, upcoming,
       counts: { total: matches.length, live: live.length, finished: finished.length, upcoming: upcoming.length },
-      lastUpdate: new Date().toISOString(), error: null, version: '3.2'
+      lastUpdate: new Date().toISOString(), error: null, version: '3.3'
     };
     console.log(`[Scraper] total=${matches.length} live=${live.length}`);
     return cache;
@@ -365,6 +365,8 @@ async function enrichFromFotmob(details, home, away, startIso) {
     away: at.formation || null,
     homeCoach: ht.coach?.name || null,
     awayCoach: at.coach?.name || null,
+    homeCoachPhoto: ht.coach?.id ? fotmobPhoto(ht.coach.id) : null,
+    awayCoachPhoto: at.coach?.id ? fotmobPhoto(at.coach.id) : null,
     confirmed: true
   };
 
@@ -640,8 +642,252 @@ async function proxyHls(req, res, targetUrl, referer) {
   }
 }
 
+
+// ========== LEAGUES (FotMob) ==========
+const leagueCache = new Map();
+const LEAGUE_TTL = 5 * 60 * 1000;
+
+const LEAGUES = [
+  { id: 47, name: 'Premier League', nameAr: 'الدوري الإنجليزي', country: 'England', type: 'league' },
+  { id: 87, name: 'LaLiga', nameAr: 'الدوري الإسباني', country: 'Spain', type: 'league' },
+  { id: 55, name: 'Serie A', nameAr: 'الدوري الإيطالي', country: 'Italy', type: 'league' },
+  { id: 54, name: 'Bundesliga', nameAr: 'الدوري الألماني', country: 'Germany', type: 'league' },
+  { id: 53, name: 'Ligue 1', nameAr: 'الدوري الفرنسي', country: 'France', type: 'league' },
+  { id: 42, name: 'Champions League', nameAr: 'دوري أبطال أوروبا', country: 'Europe', type: 'cup' },
+  { id: 73, name: 'Europa League', nameAr: 'الدوري الأوروبي', country: 'Europe', type: 'cup' },
+  { id: 57, name: 'Eredivisie', nameAr: 'الدوري الهولندي', country: 'Netherlands', type: 'league' },
+  { id: 61, name: 'Liga Portugal', nameAr: 'الدوري البرتغالي', country: 'Portugal', type: 'league' },
+  { id: 71, name: 'Saudi Pro League', nameAr: 'الدوري السعودي', country: 'Saudi Arabia', type: 'league' },
+  { id: 46, name: 'Championship', nameAr: 'الشنبونة الإنجليزية', country: 'England', type: 'league' },
+  { id: 130, name: 'MLS', nameAr: 'الدوري الأمريكي', country: 'USA', type: 'league' }
+];
+
+function mapTableRows(rows) {
+  if (!Array.isArray(rows)) return [];
+  return rows.map(r => ({
+    rank: r.idx ?? r.rank ?? null,
+    id: r.id,
+    name: r.name,
+    shortName: r.shortName || r.name,
+    played: r.played,
+    wins: r.wins,
+    draws: r.draws,
+    losses: r.losses,
+    goalsFor: r.scoresStr ? Number(String(r.scoresStr).split('-')[0]) : null,
+    goalsAgainst: r.scoresStr ? Number(String(r.scoresStr).split('-')[1]) : null,
+    goalsStr: r.scoresStr || null,
+    goalDiff: r.goalConDiff ?? null,
+    pts: r.pts,
+    qualColor: r.qualColor || null,
+    logo: r.id ? `https://images.fotmob.com/image_resources/logo/teamlogo/${r.id}_small.png` : null
+  }));
+}
+
+function mapFixtures(list) {
+  if (!Array.isArray(list)) return [];
+  return list.map(m => {
+    const st = m.status || {};
+    let statusType = 'upcoming';
+    if (st.finished) statusType = 'finished';
+    else if (st.started && !st.finished) statusType = 'live';
+    return {
+      id: m.id,
+      round: m.roundName || m.round || null,
+      home: m.home?.name || m.home?.shortName,
+      away: m.away?.name || m.away?.shortName,
+      homeId: m.home?.id,
+      awayId: m.away?.id,
+      homeLogo: m.home?.id ? `https://images.fotmob.com/image_resources/logo/teamlogo/${m.home.id}_small.png` : null,
+      awayLogo: m.away?.id ? `https://images.fotmob.com/image_resources/logo/teamlogo/${m.away.id}_small.png` : null,
+      score: st.scoreStr || null,
+      status: st.reason?.long || (st.finished ? 'انتهت' : st.started ? 'مباشر' : 'لم تبدأ'),
+      statusType,
+      utcTime: st.utcTime || null,
+      pageUrl: m.pageUrl || null
+    };
+  });
+}
+
+function mapScorers(playersStats) {
+  if (!Array.isArray(playersStats)) return [];
+  const goals = playersStats.find(p => p.name === 'goals' || /top scorer/i.test(p.header || ''));
+  if (!goals) return [];
+  // Prefer full list URL later; use topThree + participant as seed
+  const list = [];
+  const seen = new Set();
+  const push = (p) => {
+    if (!p || !p.id || seen.has(p.id)) return;
+    seen.add(p.id);
+    list.push({
+      id: p.id,
+      rank: p.rank ?? list.length + 1,
+      name: p.name,
+      teamId: p.teamId,
+      teamName: p.teamName,
+      goals: p.value ?? p.stat?.value ?? null,
+      photo: fotmobPhoto(p.id),
+      teamLogo: p.teamId ? `https://images.fotmob.com/image_resources/logo/teamlogo/${p.teamId}_small.png` : null
+    });
+  };
+  (goals.topThree || []).forEach(push);
+  if (goals.participant) push(goals.participant);
+  return list;
+}
+
+async function fetchFullScorers(fetchAllUrl) {
+  if (!fetchAllUrl) return [];
+  try {
+    // data.fotmob.com sometimes works
+    const data = await fotmobGet(fetchAllUrl.replace('https://data.fotmob.com', 'https://www.fotmob.com').replace('https://data.fotmob.com', 'https://data.fotmob.com'));
+    // try raw
+  } catch (_) {}
+  try {
+    const { data } = await get(fetchAllUrl, {
+      headers: { 'User-Agent': UA, Accept: 'application/json', Referer: 'https://www.fotmob.com/' },
+      timeout: 12000
+    }, 1);
+    const arr = Array.isArray(data) ? data : (data?.statsList || data?.players || data?.TopLists || []);
+    // common shape: [{ParticipantName, TeamName, StatValue, ParticipantId, TeamId, Rank}]
+    if (Array.isArray(data) && data.length && data[0].StatValue != null) {
+      return data.slice(0, 30).map((p, i) => ({
+        id: p.ParticipantId || p.id,
+        rank: p.Rank ?? i + 1,
+        name: p.ParticipantName || p.name,
+        teamId: p.TeamId || p.teamId,
+        teamName: p.TeamName || p.teamName,
+        goals: p.StatValue ?? p.value,
+        photo: fotmobPhoto(p.ParticipantId || p.id),
+        teamLogo: (p.TeamId || p.teamId) ? `https://images.fotmob.com/image_resources/logo/teamlogo/${p.TeamId || p.teamId}_small.png` : null
+      }));
+    }
+    if (Array.isArray(arr) && arr.length) {
+      return arr.slice(0, 30).map((p, i) => ({
+        id: p.id || p.ParticipantId,
+        rank: p.rank ?? p.Rank ?? i + 1,
+        name: p.name || p.ParticipantName,
+        teamId: p.teamId || p.TeamId,
+        teamName: p.teamName || p.TeamName,
+        goals: p.value ?? p.StatValue ?? p.stat?.value,
+        photo: fotmobPhoto(p.id || p.ParticipantId),
+        teamLogo: (p.teamId || p.TeamId) ? `https://images.fotmob.com/image_resources/logo/teamlogo/${p.teamId || p.TeamId}_small.png` : null
+      }));
+    }
+  } catch (e) {
+    console.error('[Scorers full]', e.message);
+  }
+  return [];
+}
+
+async function fetchLeagueDetails(leagueId) {
+  const id = Number(leagueId);
+  const hit = leagueCache.get(id);
+  if (hit && Date.now() - hit.ts < LEAGUE_TTL) return hit.data;
+
+  const data = await fotmobGet(`https://www.fotmob.com/api/data/leagues?id=${id}`);
+  if (!data || !data.details) throw new Error('League not found');
+
+  // table
+  let standings = [];
+  try {
+    const t0 = (data.table || [])[0];
+    const rows = t0?.data?.table?.all || t0?.data?.table?.All || [];
+    standings = mapTableRows(rows);
+  } catch (_) {}
+
+  // fixtures
+  let fixtures = [];
+  try {
+    fixtures = mapFixtures(data.fixtures?.allMatches || []);
+  } catch (_) {}
+
+  // scorers
+  let scorers = mapScorers(data.stats?.players || []);
+  const goalsBlock = (data.stats?.players || []).find(p => p.name === 'goals' || /top scorer/i.test(p.header || ''));
+  if (goalsBlock?.fetchAllUrl) {
+    const full = await fetchFullScorers(goalsBlock.fetchAllUrl);
+    if (full.length) scorers = full;
+  }
+
+  // also assists top 3
+  let assists = [];
+  const ass = (data.stats?.players || []).find(p => p.name === 'goal_assist' || /assist/i.test(p.header || ''));
+  if (ass) {
+    assists = (ass.topThree || []).map((p, i) => ({
+      id: p.id,
+      rank: p.rank ?? i + 1,
+      name: p.name,
+      teamId: p.teamId,
+      teamName: p.teamName,
+      assists: p.value,
+      photo: fotmobPhoto(p.id),
+      teamLogo: p.teamId ? `https://images.fotmob.com/image_resources/logo/teamlogo/${p.teamId}_small.png` : null
+    }));
+  }
+
+  const meta = LEAGUES.find(l => l.id === id) || {};
+  const result = {
+    id,
+    name: data.details.name || meta.name,
+    nameAr: meta.nameAr || data.details.name,
+    shortName: data.details.shortName || null,
+    country: data.details.country || meta.country || null,
+    season: data.details.selectedSeason || null,
+    type: meta.type || 'league',
+    logo: `https://images.fotmob.com/image_resources/logo/leaguelogo/${id}.png`,
+    standings,
+    scorers,
+    assists,
+    fixtures,
+    counts: {
+      teams: standings.length,
+      scorers: scorers.length,
+      fixtures: fixtures.length
+    },
+    updatedAt: new Date().toISOString()
+  };
+
+  leagueCache.set(id, { ts: Date.now(), data: result });
+  return result;
+}
+
+
 // ========== ROUTES ==========
+
 app.get('/api/matches', (req, res) => res.json({ success: true, ...cache }));
+
+// قائمة الدوريات والبطولات
+app.get('/api/leagues', (req, res) => {
+  res.json({
+    success: true,
+    leagues: LEAGUES.map(l => ({
+      ...l,
+      logo: `https://images.fotmob.com/image_resources/logo/leaguelogo/${l.id}.png`
+    }))
+  });
+});
+
+// تفاصيل دوري: ترتيب + هدافين + مباريات
+app.get('/api/league/:id', async (req, res) => {
+  try {
+    const data = await fetchLeagueDetails(req.params.id);
+    res.json({ success: true, league: data });
+  } catch (e) {
+    console.error('[League]', e.message);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+app.get('/api/league', async (req, res) => {
+  const id = req.query.id;
+  if (!id) return res.status(400).json({ success: false, error: 'id required' });
+  try {
+    const data = await fetchLeagueDetails(id);
+    res.json({ success: true, league: data });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
 
 app.get('/api/match/details', async (req, res) => {
   const link = req.query.link ? decodeURIComponent(req.query.link) : null;
@@ -701,7 +947,7 @@ app.get('/proxy', async (req, res) => {
 
 app.get('/health', (req, res) => {
   res.json({
-    status: 'ok', version: '3.2', uptime: process.uptime(),
+    status: 'ok', version: '3.3', uptime: process.uptime(),
     lastUpdate: cache.lastUpdate, counts: cache.counts,
     caches: { details: detailsCache.size, streams: streamCache.size }
   });
@@ -709,10 +955,12 @@ app.get('/health', (req, res) => {
 
 app.get('/', (req, res) => {
   res.json({
-    name: 'Sir TV Live Server', version: '3.2', status: 'running',
-    features: ['matches', 'rich-details-fotmob', 'lineups', 'events', 'stats', 'full-hls-proxy'],
+    name: 'Sir TV Live Server', version: '3.3', status: 'running',
+    features: ['matches', 'leagues', 'standings', 'scorers', 'fixtures', 'rich-details-fotmob', 'full-hls-proxy'],
     endpoints: {
       matches: 'GET /api/matches',
+      leagues: 'GET /api/leagues',
+      league: 'GET /api/league/:id',
       stream: 'GET /api/stream?link=',
       details: 'GET /api/match/details?link=&id=&home=&away=',
       health: 'GET /health'
@@ -726,6 +974,7 @@ setInterval(() => {
   const now = Date.now();
   for (const [k, v] of detailsCache) if (now - v.ts > 10 * 60 * 1000) detailsCache.delete(k);
   for (const [k, v] of streamCache) if (now - v.ts > 5 * 60 * 1000) streamCache.delete(k);
+  for (const [k, v] of leagueCache) if (now - v.ts > 30 * 60 * 1000) leagueCache.delete(k);
 }, 5 * 60 * 1000);
 
 async function boot() {
@@ -740,6 +989,6 @@ async function boot() {
 boot().catch(console.error);
 
 server.listen(PORT, () => {
-  console.log(`\n🔥 Sir TV Live v3.2 — port ${PORT}`);
+  console.log(`\n🔥 Sir TV Live v3.3 — port ${PORT}`);
   console.log(`   Rich details (FotMob) | Lineups | Events | Full proxy\n`);
 });
