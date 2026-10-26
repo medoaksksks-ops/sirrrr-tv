@@ -55,7 +55,7 @@ const io = new Server(server, { cors: { origin: true }, pingInterval: 20000, pin
 let cache = {
   matches: [], live: [], finished: [], upcoming: [],
   counts: { total: 0, live: 0, finished: 0, upcoming: 0 },
-  lastUpdate: null, error: null, version: '3.1'
+  lastUpdate: null, error: null, version: '3.2'
 };
 
 const detailsCache = new Map();
@@ -63,122 +63,7 @@ const streamCache = new Map();
 const DETAILS_TTL = 90 * 1000;
 const STREAM_TTL = 45 * 1000;
 
-// Arabic / common team name → SportScore slug token
-const TEAM_SLUGS = {
-  'برشلونة': 'fc-barcelona', 'barcelona': 'fc-barcelona', 'بارسا': 'fc-barcelona',
-  'ريال مدريد': 'real-madrid', 'real madrid': 'real-madrid',
-  'أتلتيكو مدريد': 'atletico-madrid', 'اتليتكو مدريد': 'atletico-madrid',
-  'إشبيلية': 'sevilla', 'اشبيلية': 'sevilla', 'sevilla': 'sevilla',
-  'أوساسونا': 'osasuna', 'اوسامونا': 'osasuna',
-  'باريس سان جيرمان': 'paris-saint-germain', 'باريس': 'paris-saint-germain', 'psg': 'paris-saint-germain',
-  'أولمبيك ليون': 'lyon', 'ليون': 'lyon',
-  'غلطة سراي': 'galatasaray', 'جالطة سراي': 'galatasaray',
-  'فنربخشة': 'fenerbahce', 'فنربخشه': 'fenerbahce',
-  'الأهلي': 'al-ahly', 'الاهلي': 'al-ahly',
-  'الغرافة': 'al-gharafa',
-  'النصر': 'al-nassr', 'الوصل': 'al-wasl',
-  'الاتحاد': 'al-ittihad', 'الهلال': 'al-hilal',
-  'مانشستر سيتي': 'manchester-city', 'مانشستر يونايتد': 'manchester-united',
-  'ليفربول': 'liverpool', 'آرسنال': 'arsenal', 'تشيلسي': 'chelsea',
-  'يوفنتوس': 'juventus', 'ميلان': 'ac-milan', 'إنتر': 'inter',
-  'بايرن ميونخ': 'bayern-munchen', 'دورتموند': 'borussia-dortmund'
-};
 
-function to12Hour(timeStr) {
-  if (!timeStr) return '';
-  if (/[صم]|am|pm/i.test(timeStr)) return timeStr;
-  const m = String(timeStr).trim().match(/^(\d{1,2}):(\d{2})$/);
-  if (!m) return timeStr;
-  let h = parseInt(m[1], 10);
-  const min = m[2];
-  const period = h >= 12 ? 'م' : 'ص';
-  if (h === 0) h = 12;
-  else if (h > 12) h -= 12;
-  return `${h}:${min} ${period}`;
-}
-
-function slugifyTeam(name) {
-  if (!name) return '';
-  const n = String(name).trim();
-  if (TEAM_SLUGS[n]) return TEAM_SLUGS[n];
-  const lower = n.toLowerCase();
-  if (TEAM_SLUGS[lower]) return TEAM_SLUGS[lower];
-  // fallback latin slug
-  return lower
-    .replace(/[^a-z0-9\s-]/g, '')
-    .trim()
-    .replace(/\s+/g, '-')
-    .replace(/-+/g, '-');
-}
-
-// ========== MATCHES ==========
-async function fetchMatches() {
-  try {
-    const { data } = await get(SOURCE, { headers: { Referer: SOURCE, 'Cache-Control': 'no-cache' } });
-    const $ = cheerio.load(data);
-    const matches = [];
-
-    $('.AY_Match').each((_, el) => {
-      const $el = $(el);
-      const id = ($el.attr('id') || '').replace(/^m-/, '') || null;
-      let link = $el.find('a').attr('href') || null;
-      if (link && !link.startsWith('http')) link = new URL(link, SOURCE).href;
-
-      const home = $el.find('.TM1 .TM_Name').text().trim();
-      const away = $el.find('.TM2 .TM_Name').text().trim();
-      const homeLogo = $el.find('.TM1 img').attr('src') || null;
-      const awayLogo = $el.find('.TM2 img').attr('src') || null;
-      const score = $el.find('.MT_Result').text().replace(/\s+/g, ' ').trim() || 'vs';
-      const statusText = $el.find('.MT_Stat').text().trim();
-      const timeRaw = $el.find('.MT_Time span, .MT_Time').first().text().trim();
-      const isLiveClass = $el.hasClass('live') || $el.hasClass('now');
-      const start = $el.attr('data-start') || null;
-
-      let externalId = null;
-      if (link) {
-        const mm = link.match(/[?&]m=(\d+)/);
-        if (mm) externalId = mm[1];
-      }
-
-      let statusType = 'upcoming';
-      const s = (statusText || '').toLowerCase();
-      if (isLiveClass || /مباشر|live|شوط|دقيقة|توقف/.test(s)) statusType = 'live';
-      else if (/انتهت|انتهى|ft|نهاية/.test(s)) statusType = 'finished';
-
-      const hasStream = !!(link && (link.includes('korat') || link.includes('hes-goals') || /[?&]m=\d+/.test(link) || link.includes('watch-')));
-
-      if (home && away) {
-        matches.push({
-          id, externalId, home, away, homeLogo, awayLogo, score,
-          status: statusText || (statusType === 'live' ? 'مباشر' : statusType === 'finished' ? 'انتهت' : 'لم تبدأ'),
-          statusType, time: to12Hour(timeRaw), timeRaw: timeRaw || null,
-          isLive: statusType === 'live', start, link, hasStream
-        });
-      }
-    });
-
-    const order = { live: 0, upcoming: 1, finished: 2 };
-    matches.sort((a, b) => (order[a.statusType] ?? 3) - (order[b.statusType] ?? 3));
-    const live = matches.filter(m => m.statusType === 'live');
-    const finished = matches.filter(m => m.statusType === 'finished');
-    const upcoming = matches.filter(m => m.statusType === 'upcoming');
-
-    cache = {
-      matches, live, finished, upcoming,
-      counts: { total: matches.length, live: live.length, finished: finished.length, upcoming: upcoming.length },
-      lastUpdate: new Date().toISOString(), error: null, version: '3.1'
-    };
-    console.log(`[Scraper] total=${matches.length} live=${live.length}`);
-    return cache;
-  } catch (err) {
-    console.error('[Scraper]', err.message);
-    cache.error = err.message;
-    cache.lastUpdate = new Date().toISOString();
-    return cache;
-  }
-}
-
-// ========== RICH DETAILS ==========
 function emptyDetails() {
   return {
     events: [],
@@ -194,178 +79,333 @@ function emptyDetails() {
   };
 }
 
-function mapPlayers(list) {
-  if (!Array.isArray(list)) return [];
-  return list.map(p => ({
-    name: p.name || p.player || '',
-    number: p.number ?? p.shirt ?? null,
-    position: p.position || p.pos || null,
-    rating: p.rating || null,
-    captain: !!p.captain
-  })).filter(p => p.name);
+// Arabic / common names → English for FotMob matching
+const TEAM_EN = {
+  'برشلونة': 'Barcelona', 'barcelona': 'Barcelona', 'بارسا': 'Barcelona',
+  'ريال مدريد': 'Real Madrid', 'real madrid': 'Real Madrid',
+  'أتلتيكو مدريد': 'Atletico Madrid', 'اتليتكو مدريد': 'Atletico Madrid',
+  'إشبيلية': 'Sevilla', 'اشبيلية': 'Sevilla',
+  'أوساسونا': 'Osasuna',
+  'باريس سان جيرمان': 'Paris Saint-Germain', 'باريس': 'Paris Saint-Germain', 'psg': 'Paris Saint-Germain',
+  'أولمبيك ليون': 'Lyon', 'ليون': 'Lyon',
+  'غلطة سراي': 'Galatasaray', 'جالطة سراي': 'Galatasaray',
+  'فنربخشة': 'Fenerbahce',
+  'الأهلي': 'Al Ahly', 'الاهلي': 'Al Ahly',
+  'الغرافة': 'Al Gharafa',
+  'النصر': 'Al Nassr', 'الوصل': 'Al Wasl',
+  'الاتحاد': 'Al Ittihad', 'الهلال': 'Al Hilal',
+  'مانشستر سيتي': 'Manchester City', 'مانشستر يونايتد': 'Manchester United',
+  'ليفربول': 'Liverpool', 'آرسنال': 'Arsenal', 'تشيلسي': 'Chelsea',
+  'يوفنتوس': 'Juventus', 'ميلان': 'AC Milan', 'إنتر': 'Inter',
+  'بايرن ميونخ': 'Bayern München', 'دورتموند': 'Borussia Dortmund',
+  'نيفتشي فرغانة': 'Neftchi', 'الاتحاد': 'Al Ittihad'
+};
+
+function teamEn(name) {
+  if (!name) return '';
+  const n = String(name).trim();
+  if (TEAM_EN[n]) return TEAM_EN[n];
+  if (TEAM_EN[n.toLowerCase()]) return TEAM_EN[n.toLowerCase()];
+  return n;
 }
 
-function mapIncidents(list) {
-  if (!Array.isArray(list)) return [];
-  return list.map(e => {
-    const type = e.type || '';
-    let text = e.player || '';
-    if (e.is_sub || /sub/i.test(type)) {
-      text = [e.player_in, e.player_out].filter(Boolean).join(' ← ') || text;
-    }
-    return {
-      minute: e.time != null ? String(e.time) : (e.minute || null),
-      type,
-      player: e.player || e.player_in || '',
-      team: e.side === 'home' ? 'home' : e.side === 'away' ? 'away' : (e.team || ''),
-      detail: e.player_out ? `out: ${e.player_out}` : '',
-      text: text || type
-    };
-  });
+function normName(s) {
+  return String(s || '').toLowerCase().replace(/[^a-z0-9\u0600-\u06ff]+/g, ' ').trim();
 }
 
-function mapStats(stats) {
-  if (!Array.isArray(stats) || !stats.length) return [];
-  return stats.map(s => ({
-    label: s.label || s.name || s.title || '',
-    home: s.home ?? s.h ?? s.team1 ?? null,
-    away: s.away ?? s.a ?? s.team2 ?? null
-  })).filter(s => s.label && s.home != null && s.away != null);
+function namesMatch(a, b) {
+  const x = normName(a), y = normName(b);
+  if (!x || !y) return false;
+  if (x === y) return true;
+  if (x.includes(y) || y.includes(x)) return true;
+  const xs = x.split(' ').filter(w => w.length > 2);
+  const ys = y.split(' ').filter(w => w.length > 2);
+  return xs.some(w => ys.some(z => w.includes(z) || z.includes(w)));
 }
 
-async function fetchSportScoreByTeams(home, away) {
-  const h = slugifyTeam(home);
-  const a = slugifyTeam(away);
-  if (!h || !a) return null;
+function fotmobPhoto(playerId) {
+  if (!playerId) return null;
+  return `https://images.fotmob.com/image_resources/playerimages/${playerId}.png`;
+}
 
-  const slugs = [
-    `${h}-vs-${a}`,
-    `${a}-vs-${h}`,
-    // common variants
-    h.startsWith('fc-') ? `${h}-vs-${a}` : `fc-${h}-vs-${a}`,
-    a.startsWith('fc-') ? `${h}-vs-${a}` : `${h}-vs-fc-${a}`
-  ];
-
-  for (const slug of [...new Set(slugs)]) {
-    try {
-      const { data } = await get(
-        `https://sportscore.com/api/widget/match/?sport=football&slug=${encodeURIComponent(slug)}`,
-        { headers: { Accept: 'application/json' }, timeout: 10000 },
-        1
-      );
-      if (data && data.match && !data.error) return data.match;
-    } catch (_) {}
-  }
-
-  // fallback: scan recent matches list
-  try {
-    const { data } = await get(
-      'https://sportscore.com/api/widget/matches/?sport=football&limit=50',
-      { headers: { Accept: 'application/json' }, timeout: 10000 },
-      0
-    );
-    const list = data.matches || [];
-    const hn = (home || '').toLowerCase();
-    const an = (away || '').toLowerCase();
-    const engH = h.replace(/-/g, ' ');
-    const engA = a.replace(/-/g, ' ');
-    const hit = list.find(m => {
-      const mh = (m.home || '').toLowerCase();
-      const ma = (m.away || '').toLowerCase();
-      return (
-        (mh.includes(engH) && ma.includes(engA)) ||
-        (mh.includes(engA) && ma.includes(engH)) ||
-        (hn && mh.includes(hn.slice(0, 4))) // weak
-      );
-    });
-    if (hit && hit.url) {
-      const slug = String(hit.url).split('/').filter(Boolean).pop();
-      // url is like /football/match/real-madrid-vs-fc-barcelona/6ypq3nhvo1w0md7/
-      const parts = String(hit.url).split('/').filter(Boolean);
-      const maybeSlug = parts[parts.length - 2] || parts[parts.length - 1];
-      const { data: d2 } = await get(
-        `https://sportscore.com/api/widget/match/?sport=football&slug=${encodeURIComponent(maybeSlug)}`,
-        { headers: { Accept: 'application/json' }, timeout: 10000 },
-        0
-      );
-      if (d2 && d2.match) return d2.match;
-    }
-  } catch (_) {}
-
+function posFromId(positionId) {
+  // FotMob rough groups
+  const id = Number(positionId);
+  if (id === 0 || id === 11) return 'G';
+  if (id >= 1 && id <= 4) return 'D';
+  if (id >= 5 && id <= 8) return 'M';
+  if (id >= 9 && id <= 10) return 'F';
   return null;
 }
 
-async function enrichFromSportScore(details, home, away) {
-  const match = await fetchSportScoreByTeams(home, away);
-  if (!match) return false;
+function mapFotmobPlayers(list) {
+  if (!Array.isArray(list)) return [];
+  return list.map(p => ({
+    id: p.id,
+    name: p.name || `${p.firstName || ''} ${p.lastName || ''}`.trim(),
+    number: p.shirtNumber != null ? String(p.shirtNumber) : null,
+    position: posFromId(p.positionId) || p.positionLabel || null,
+    rating: (p.performance && p.performance.rating) || p.rating || null,
+    captain: !!p.captain,
+    photo: fotmobPhoto(p.id)
+  })).filter(p => p.name);
+}
 
-  details.source = 'sportscore';
-  if (match.incidents) details.events = mapIncidents(match.incidents);
+function mapFotmobStats(periods) {
+  const all = (periods && (periods.All || periods.all)) || {};
+  const groups = all.stats || [];
+  const out = [];
+  for (const g of groups) {
+    for (const s of (g.stats || [])) {
+      const arr = s.stats || [];
+      if (arr.length >= 2) {
+        out.push({
+          label: s.title || s.key || '',
+          home: arr[0],
+          away: arr[1]
+        });
+      }
+    }
+  }
+  return out.filter(x => x.label);
+}
 
-  const lu = match.lineups || {};
-  if (lu.home_xi) details.homeLineup = mapPlayers(lu.home_xi);
-  if (lu.away_xi) details.awayLineup = mapPlayers(lu.away_xi);
-  if (lu.home_subs) details.homeSubs = mapPlayers(lu.home_subs);
-  if (lu.away_subs) details.awaySubs = mapPlayers(lu.away_subs);
-  details.formations = {
-    home: lu.home_formation || null,
-    away: lu.away_formation || null,
-    homeCoach: lu.home_coach || null,
-    awayCoach: lu.away_coach || null,
-    confirmed: !!lu.confirmed
+function mapFotmobEvents(headerEvents) {
+  // header.events is nested by team goals etc. Prefer content.matchFacts.events if available
+  return [];
+}
+
+async function fotmobGet(url) {
+  const { data } = await get(url, {
+    headers: {
+      'User-Agent': UA,
+      Accept: 'application/json',
+      Referer: 'https://www.fotmob.com/'
+    },
+    timeout: 14000
+  }, 1);
+  return data;
+}
+
+function dateCandidates(startIso) {
+  const dates = [];
+  const push = (d) => {
+    const y = d.getUTCFullYear();
+    const m = String(d.getUTCMonth() + 1).padStart(2, '0');
+    const day = String(d.getUTCDate()).padStart(2, '0');
+    dates.push(`${y}${m}${day}`);
   };
+  if (startIso) {
+    const d = new Date(startIso);
+    if (!isNaN(d)) {
+      push(d);
+      const prev = new Date(d); prev.setUTCDate(prev.getUTCDate() - 1); push(prev);
+      const next = new Date(d); next.setUTCDate(next.getUTCDate() + 1); push(next);
+    }
+  }
+  const now = new Date();
+  push(now);
+  const yday = new Date(now); yday.setUTCDate(yday.getUTCDate() - 1); push(yday);
+  return [...new Set(dates)];
+}
 
-  details.stats = mapStats(match.stats);
+async function findFotmobMatchId(home, away, startIso) {
+  const hEn = teamEn(home);
+  const aEn = teamEn(away);
+  for (const date of dateCandidates(startIso)) {
+    try {
+      const data = await fotmobGet(`https://www.fotmob.com/api/data/matches?date=${date}`);
+      for (const lg of data.leagues || []) {
+        for (const m of lg.matches || []) {
+          const hn = m.home?.name || m.home?.longName || '';
+          const an = m.away?.name || m.away?.longName || '';
+          if (
+            (namesMatch(hn, hEn) && namesMatch(an, aEn)) ||
+            (namesMatch(hn, aEn) && namesMatch(an, hEn)) ||
+            (namesMatch(hn, home) && namesMatch(an, away))
+          ) {
+            return m.id;
+          }
+        }
+      }
+    } catch (e) {
+      console.error('[FotMob matches]', date, e.message);
+    }
+  }
+  return null;
+}
+
+async function enrichFromFotmob(details, home, away, startIso) {
+  const matchId = await findFotmobMatchId(home, away, startIso);
+  if (!matchId) return false;
+
+  const data = await fotmobGet(`https://www.fotmob.com/api/data/matchDetails?matchId=${matchId}`);
+  if (!data || !data.content) return false;
+
+  details.source = 'fotmob';
+  details.fotmobId = matchId;
+
+  const content = data.content;
+  const infoBox = content.matchFacts?.infoBox || {};
+  const stadium = infoBox.Stadium || {};
+  const referee = infoBox.Referee || {};
+  const tournament = infoBox.Tournament || {};
 
   details.info = {
-    competition: match.competition || null,
-    homeScore: match.home_score,
-    awayScore: match.away_score,
-    htHome: match.home_ht_score,
-    htAway: match.away_ht_score,
-    status: match.status_text || match.status,
-    time: match.time,
-    home: match.home,
-    away: match.away
+    competition: tournament.leagueName || data.general?.leagueName || null,
+    round: tournament.roundName || tournament.round || null,
+    stadium: stadium.name || null,
+    city: stadium.city || null,
+    country: stadium.country || null,
+    capacity: stadium.capacity || null,
+    attendance: infoBox.Attendance || null,
+    referee: referee.text || referee.name || null,
+    refereeCountry: referee.country || null,
+    date: infoBox['Match Date']?.utcTime || data.general?.matchTimeUTC || null,
+    home: data.header?.teams?.[0]?.name || home,
+    away: data.header?.teams?.[1]?.name || away,
+    homeScore: data.header?.teams?.[0]?.score,
+    awayScore: data.header?.teams?.[1]?.score,
+    status: data.header?.status?.reason?.long || (data.general?.finished ? 'Full-Time' : null)
   };
+
+  // lineups + coaches
+  const lu = content.lineup || {};
+  const ht = lu.homeTeam || {};
+  const at = lu.awayTeam || {};
+  details.homeLineup = mapFotmobPlayers(ht.starters);
+  details.awayLineup = mapFotmobPlayers(at.starters);
+  details.homeSubs = mapFotmobPlayers(ht.subs);
+  details.awaySubs = mapFotmobPlayers(at.subs);
+  details.formations = {
+    home: ht.formation || null,
+    away: at.formation || null,
+    homeCoach: ht.coach?.name || null,
+    awayCoach: at.coach?.name || null,
+    confirmed: true
+  };
+
+  // stats
+  details.stats = mapFotmobStats(content.stats?.Periods);
+
+  // events from matchFacts
+  const ev = content.matchFacts?.events || {};
+  const events = [];
+  // FotMob structure varies; also pull from header.events goals
+  const headerEv = data.header?.events || {};
+  for (const side of ['homeTeamGoals', 'awayTeamGoals']) {
+    const bag = headerEv[side] || {};
+    for (const [playerName, arr] of Object.entries(bag)) {
+      for (const g of arr || []) {
+        events.push({
+          minute: g.time != null ? String(g.time) : null,
+          type: g.type || 'Goal',
+          player: g.player?.name || playerName,
+          team: side.startsWith('home') ? 'home' : 'away',
+          detail: g.assistStr || '',
+          text: g.player?.name || playerName
+        });
+      }
+    }
+  }
+  // cards if present
+  for (const side of ['homeTeamRedCards', 'awayTeamRedCards']) {
+    const bag = headerEv[side] || {};
+    for (const [playerName, arr] of Object.entries(bag)) {
+      for (const c of arr || []) {
+        events.push({
+          minute: c.time != null ? String(c.time) : null,
+          type: 'Red card',
+          player: playerName,
+          team: side.startsWith('home') ? 'home' : 'away',
+          text: playerName
+        });
+      }
+    }
+  }
+  if (events.length) {
+    events.sort((a, b) => (parseInt(a.minute) || 0) - (parseInt(b.minute) || 0));
+    details.events = events;
+  }
 
   return true;
 }
 
+// keep sportscore as weak fallback for lineups only
+async function enrichFromSportScore(details, home, away) {
+  try {
+    const h = teamEn(home).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+    const a = teamEn(away).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+    const slugs = [`${h}-vs-${a}`, `${a}-vs-${h}`, `fc-${h}-vs-${a}`, `${h}-vs-fc-${a}`];
+    for (const slug of [...new Set(slugs)]) {
+      try {
+        const { data } = await get(
+          `https://sportscore.com/api/widget/match/?sport=football&slug=${encodeURIComponent(slug)}`,
+          { headers: { Accept: 'application/json' }, timeout: 9000 },
+          0
+        );
+        const match = data && data.match;
+        if (!match) continue;
+        if (!details.source) details.source = 'sportscore';
+        if (!details.events.length && match.incidents) {
+          details.events = (match.incidents || []).map(e => ({
+            minute: e.time != null ? String(e.time) : null,
+            type: e.type || '',
+            player: e.player || e.player_in || '',
+            team: e.side === 'home' ? 'home' : e.side === 'away' ? 'away' : '',
+            text: e.player || [e.player_in, e.player_out].filter(Boolean).join(' ← ') || e.type
+          }));
+        }
+        const lu = match.lineups || {};
+        if (!details.homeLineup.length && lu.home_xi) {
+          details.homeLineup = (lu.home_xi || []).map(p => ({
+            name: p.name, number: p.number, position: p.position, rating: p.rating,
+            captain: !!p.captain, photo: null
+          }));
+        }
+        if (!details.awayLineup.length && lu.away_xi) {
+          details.awayLineup = (lu.away_xi || []).map(p => ({
+            name: p.name, number: p.number, position: p.position, rating: p.rating,
+            captain: !!p.captain, photo: null
+          }));
+        }
+        if (!details.formations.home && lu.home_formation) {
+          details.formations = {
+            home: lu.home_formation, away: lu.away_formation,
+            homeCoach: lu.home_coach, awayCoach: lu.away_coach, confirmed: !!lu.confirmed
+          };
+        }
+        return true;
+      } catch (_) {}
+    }
+  } catch (_) {}
+  return false;
+}
+
 async function trySirTvPage(url, details) {
   try {
-    const { data } = await get(url, { headers: { Referer: SOURCE } }, 1);
+    const { data } = await get(url, { headers: { Referer: SOURCE } }, 0);
     const $ = cheerio.load(data);
-    const events = [];
-    $('.event, .match-event, .goal, .card, .aspi-event, #aspi_evebody li').each((_, el) => {
-      const t = $(el).text().replace(/\s+/g, ' ').trim();
-      if (t && t.length < 140) events.push({ text: t, minute: null, type: '', player: '', team: '' });
-    });
-    if (events.length && !details.events.length) details.events = events;
-
-    const homePlayers = [], awayPlayers = [];
-    $('.aspi_lineup .home li, .lineup .home li, .home-lineup li').each((_, el) => {
-      const t = $(el).text().replace(/\s+/g, ' ').trim();
-      if (t) homePlayers.push({ name: t });
-    });
-    $('.aspi_lineup .away li, .lineup .away li, .away-lineup li').each((_, el) => {
-      const t = $(el).text().replace(/\s+/g, ' ').trim();
-      if (t) awayPlayers.push({ name: t });
-    });
-    if (homePlayers.length && !details.homeLineup.length) details.homeLineup = homePlayers;
-    if (awayPlayers.length && !details.awayLineup.length) details.awayLineup = awayPlayers;
     if (!details.source) details.source = 'sir-tv';
   } catch (_) {}
 }
 
 async function fetchMatchDetails(matchLink, externalId, home, away) {
-  // resolve home/away from cache if missing
+  let startIso = null;
   if ((!home || !away) && (matchLink || externalId)) {
     const m = cache.matches.find(x =>
       (externalId && (x.externalId === externalId || x.id === externalId)) ||
       (matchLink && x.link === matchLink)
     );
-    if (m) { home = home || m.home; away = away || m.away; matchLink = matchLink || m.link; }
+    if (m) {
+      home = home || m.home;
+      away = away || m.away;
+      matchLink = matchLink || m.link;
+      startIso = m.start || null;
+    }
+  } else if (home && away) {
+    const m = cache.matches.find(x => x.home === home && x.away === away);
+    if (m) startIso = m.start || null;
   }
 
   const key = String(externalId || matchLink || `${home}-${away}`);
@@ -374,14 +414,18 @@ async function fetchMatchDetails(matchLink, externalId, home, away) {
 
   const details = emptyDetails();
 
-  // Primary: SportScore rich data
   if (home && away) {
-    try { await enrichFromSportScore(details, home, away); } catch (e) {
-      console.error('[SportScore]', e.message);
+    try {
+      await enrichFromFotmob(details, home, away, startIso);
+    } catch (e) {
+      console.error('[FotMob]', e.message);
     }
   }
 
-  // Secondary: sir-tv page
+  // fallback
+  if (!details.homeLineup.length && home && away) {
+    await enrichFromSportScore(details, home, away);
+  }
   if (matchLink && /sir-tv\.vip/i.test(matchLink)) {
     await trySirTvPage(matchLink, details);
   }
@@ -574,7 +618,7 @@ app.get('/proxy', async (req, res) => {
 
 app.get('/health', (req, res) => {
   res.json({
-    status: 'ok', version: '3.1', uptime: process.uptime(),
+    status: 'ok', version: '3.2', uptime: process.uptime(),
     lastUpdate: cache.lastUpdate, counts: cache.counts,
     caches: { details: detailsCache.size, streams: streamCache.size }
   });
@@ -582,8 +626,8 @@ app.get('/health', (req, res) => {
 
 app.get('/', (req, res) => {
   res.json({
-    name: 'Sir TV Live Server', version: '3.1', status: 'running',
-    features: ['matches', 'rich-details-sportscore', 'lineups', 'events', 'stats', 'full-hls-proxy'],
+    name: 'Sir TV Live Server', version: '3.2', status: 'running',
+    features: ['matches', 'rich-details-fotmob', 'lineups', 'events', 'stats', 'full-hls-proxy'],
     endpoints: {
       matches: 'GET /api/matches',
       stream: 'GET /api/stream?link=',
@@ -613,6 +657,6 @@ async function boot() {
 boot().catch(console.error);
 
 server.listen(PORT, () => {
-  console.log(`\n🔥 Sir TV Live v3.1 — port ${PORT}`);
+  console.log(`\n🔥 Sir TV Live v3.2 — port ${PORT}`);
   console.log(`   Rich details (SportScore) | Lineups | Events | Full proxy\n`);
 });
