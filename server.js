@@ -1,5 +1,5 @@
 /**
- * Sir TV Live Server v3.5 — Rich details + stable streams
+ * Sir TV Live Server v3.6 — Rich details + stable streams
  */
 const express = require('express');
 const http = require('http');
@@ -56,7 +56,7 @@ const io = new Server(server, { cors: { origin: true }, pingInterval: 20000, pin
 let cache = {
   matches: [], live: [], finished: [], upcoming: [],
   counts: { total: 0, live: 0, finished: 0, upcoming: 0 },
-  lastUpdate: null, error: null, version: '3.5'
+  lastUpdate: null, error: null, version: '3.6'
 };
 
 const detailsCache = new Map();
@@ -133,7 +133,7 @@ async function fetchMatches() {
     cache = {
       matches, live, finished, upcoming,
       counts: { total: matches.length, live: live.length, finished: finished.length, upcoming: upcoming.length },
-      lastUpdate: new Date().toISOString(), error: null, version: '3.5'
+      lastUpdate: new Date().toISOString(), error: null, version: '3.6'
     };
     console.log(`[Scraper] total=${matches.length} live=${live.length}`);
     return cache;
@@ -785,25 +785,33 @@ async function fetchLeagueDetails(leagueId) {
   const hit = leagueCache.get(id);
   if (hit && Date.now() - hit.ts < LEAGUE_TTL) return hit.data;
 
+  // Prefer latest season (e.g. Egypt 2026/2027)
   let data = await fotmobGet(`https://www.fotmob.com/api/data/leagues?id=${id}`);
   if (!data || !data.details) throw new Error('League not found');
+  const seasons = data.allAvailableSeasons || [];
+  const latest = seasons[0] || data.details.selectedSeason;
+  if (latest && data.details.selectedSeason !== latest) {
+    try {
+      const dLatest = await fotmobGet(`https://www.fotmob.com/api/data/leagues?id=${id}&season=${encodeURIComponent(latest)}`);
+      if (dLatest && dLatest.details) data = dLatest;
+    } catch (_) {}
+  }
 
-  // Some leagues (e.g. Egypt) have empty table on brand-new season → fallback
   const hasTable = (d) => {
     if (Array.isArray(d?.table) && d.table.length) return true;
     if (Array.isArray(d?.overview?.table) && d.overview.table.length) return true;
     return false;
   };
+
+  // Keep latest season as primary; only borrow standings from previous season if empty
+  let standingsSeason = data.details?.selectedSeason || latest || null;
+  let standingsSource = data;
   if (!hasTable(data)) {
-    const seasons = data.allAvailableSeasons || [];
-    for (const season of seasons.slice(0, 4)) {
-      if (season === data.details?.selectedSeason) continue;
+    for (const season of seasons.slice(0, 5)) {
+      if (season === standingsSeason) continue;
       try {
         const d2 = await fotmobGet(`https://www.fotmob.com/api/data/leagues?id=${id}&season=${encodeURIComponent(season)}`);
-        if (hasTable(d2)) {
-          data = d2;
-          break;
-        }
+        if (hasTable(d2)) { standingsSource = d2; break; }
       } catch (_) {}
     }
   }
@@ -812,9 +820,10 @@ async function fetchLeagueDetails(leagueId) {
   let standings = [];
   let groups = [];
   try {
-    const tableRoot = (Array.isArray(data.table) && data.table.length)
-      ? data.table
-      : (Array.isArray(data.overview?.table) ? data.overview.table : []);
+    const tableSrc = standingsSource || data;
+    const tableRoot = (Array.isArray(tableSrc.table) && tableSrc.table.length)
+      ? tableSrc.table
+      : (Array.isArray(tableSrc.overview?.table) ? tableSrc.overview.table : []);
 
     for (const t0 of tableRoot) {
       const td = t0?.data || t0 || {};
@@ -869,7 +878,8 @@ async function fetchLeagueDetails(leagueId) {
     nameAr: meta.nameAr || data.details.name,
     shortName: data.details.shortName || null,
     country: data.details.country || meta.country || null,
-    season: data.details.selectedSeason || null,
+    season: data.details.selectedSeason || latest || null,
+    standingsSeason: (standingsSource && standingsSource.details && standingsSource.details.selectedSeason) || standingsSeason || null,
     type: meta.type || 'league',
     logo: `https://images.fotmob.com/image_resources/logo/leaguelogo/${id}.png`,
     standings,
@@ -1087,7 +1097,7 @@ app.get('/proxy', async (req, res) => {
 
 app.get('/health', (req, res) => {
   res.json({
-    status: 'ok', version: '3.5', uptime: process.uptime(),
+    status: 'ok', version: '3.6', uptime: process.uptime(),
     lastUpdate: cache.lastUpdate, counts: cache.counts,
     caches: { details: detailsCache.size, streams: streamCache.size }
   });
@@ -1095,7 +1105,7 @@ app.get('/health', (req, res) => {
 
 app.get('/', (req, res) => {
   res.json({
-    name: 'Sir TV Live Server', version: '3.5', status: 'running',
+    name: 'Sir TV Live Server', version: '3.6', status: 'running',
     features: ['matches', 'leagues', 'standings', 'scorers', 'fixtures', 'push-notifications', 'rich-details-fotmob', 'full-hls-proxy'],
     endpoints: {
       matches: 'GET /api/matches',
@@ -1135,6 +1145,6 @@ async function boot() {
 boot().catch(console.error);
 
 server.listen(PORT, () => {
-  console.log(`\n🔥 Sir TV Live v3.5 — port ${PORT}`);
+  console.log(`\n🔥 Sir TV Live v3.6 — port ${PORT}`);
   console.log(`   Rich details (FotMob) | Lineups | Events | Full proxy\n`);
 });
