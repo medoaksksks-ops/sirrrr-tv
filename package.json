@@ -1,6 +1,6 @@
 {
   "name": "sir-tv-live",
-  "version": "2.0.1",
+  "version": "3.1.0",
   "main": "server.js",
   "type": "commonjs",
   "scripts": {
