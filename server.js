@@ -734,48 +734,53 @@ function mapScorers(playersStats) {
   return list;
 }
 
-async function fetchFullScorers(fetchAllUrl) {
+// يلاقي أول مصفوفة لاعبين جوه أي شكل رد (Array / TopLists[].StatList / statsList ...)
+function findStatRows(node, depth = 0) {
+  if (!node || depth > 4) return null;
+  if (Array.isArray(node)) {
+    if (node.length && node[0] && typeof node[0] === 'object' &&
+        (node[0].ParticipantName != null || node[0].name != null || node[0].participantName != null)) return node;
+    for (const x of node) { const r = findStatRows(x, depth + 1); if (r) return r; }
+    return null;
+  }
+  if (typeof node === 'object') {
+    for (const k of ['StatList', 'statList', 'TopLists', 'topLists', 'statsList', 'players']) {
+      if (node[k]) { const r = findStatRows(node[k], depth + 1); if (r) return r; }
+    }
+  }
+  return null;
+}
+
+function mapStatRow(p, i, field) {
+  const teamId = p.TeamId ?? p.teamId ?? null;
+  const id = p.ParticipantId ?? p.participantId ?? p.id ?? null;
+  const val = p.StatValue ?? p.statValue ?? p.value ?? p.stat?.value ?? null;
+  return {
+    id,
+    rank: p.Rank ?? p.rank ?? i + 1,
+    name: p.ParticipantName ?? p.participantName ?? p.name ?? '',
+    teamId,
+    teamName: p.TeamName ?? p.teamName ?? '',
+    [field]: val,
+    photo: fotmobPhoto(id),
+    teamLogo: teamId ? `https://images.fotmob.com/image_resources/logo/teamlogo/${teamId}_small.png` : null
+  };
+}
+
+async function fetchFullStat(fetchAllUrl, field) {
   if (!fetchAllUrl) return [];
-  try {
-    // data.fotmob.com sometimes works
-    const data = await fotmobGet(fetchAllUrl.replace('https://data.fotmob.com', 'https://www.fotmob.com').replace('https://data.fotmob.com', 'https://data.fotmob.com'));
-    // try raw
-  } catch (_) {}
   try {
     const { data } = await get(fetchAllUrl, {
       headers: { 'User-Agent': UA, Accept: 'application/json', Referer: 'https://www.fotmob.com/' },
       timeout: 12000
     }, 1);
-    const arr = Array.isArray(data) ? data : (data?.statsList || data?.players || data?.TopLists || []);
-    // common shape: [{ParticipantName, TeamName, StatValue, ParticipantId, TeamId, Rank}]
-    if (Array.isArray(data) && data.length && data[0].StatValue != null) {
-      return data.slice(0, 30).map((p, i) => ({
-        id: p.ParticipantId || p.id,
-        rank: p.Rank ?? i + 1,
-        name: p.ParticipantName || p.name,
-        teamId: p.TeamId || p.teamId,
-        teamName: p.TeamName || p.teamName,
-        goals: p.StatValue ?? p.value,
-        photo: fotmobPhoto(p.ParticipantId || p.id),
-        teamLogo: (p.TeamId || p.teamId) ? `https://images.fotmob.com/image_resources/logo/teamlogo/${p.TeamId || p.teamId}_small.png` : null
-      }));
-    }
-    if (Array.isArray(arr) && arr.length) {
-      return arr.slice(0, 30).map((p, i) => ({
-        id: p.id || p.ParticipantId,
-        rank: p.rank ?? p.Rank ?? i + 1,
-        name: p.name || p.ParticipantName,
-        teamId: p.teamId || p.TeamId,
-        teamName: p.teamName || p.TeamName,
-        goals: p.value ?? p.StatValue ?? p.stat?.value,
-        photo: fotmobPhoto(p.id || p.ParticipantId),
-        teamLogo: (p.teamId || p.TeamId) ? `https://images.fotmob.com/image_resources/logo/teamlogo/${p.teamId || p.TeamId}_small.png` : null
-      }));
-    }
+    const rows = findStatRows(data);
+    if (!rows) { console.error('[Stat full] unknown shape for', fetchAllUrl); return []; }
+    return rows.map((p, i) => mapStatRow(p, i, field)).filter(x => x.name).slice(0, 30);
   } catch (e) {
-    console.error('[Scorers full]', e.message);
+    console.error('[Stat full]', e.message);
+    return [];
   }
-  return [];
 }
 
 async function fetchLeagueDetails(leagueId) {
@@ -800,29 +805,30 @@ async function fetchLeagueDetails(leagueId) {
     fixtures = mapFixtures(data.fixtures?.allMatches || []);
   } catch (_) {}
 
-  // scorers
-  let scorers = mapScorers(data.stats?.players || []);
-  const goalsBlock = (data.stats?.players || []).find(p => p.name === 'goals' || /top scorer/i.test(p.header || ''));
+  // scorers + assists (الأعلى 30 من الرابط الكامل، وإلا أفضل 3 من الصفحة)
+  const players = data.stats?.players || [];
+  const goalsBlock = players.find(p => p.name === 'goals' || /top scorer|goals/i.test(p.header || ''));
+  const assistBlock = players.find(p => p.name === 'goal_assist' || /assist/i.test(p.header || ''));
+
+  let scorers = mapScorers(players);
   if (goalsBlock?.fetchAllUrl) {
-    const full = await fetchFullScorers(goalsBlock.fetchAllUrl);
+    const full = await fetchFullStat(goalsBlock.fetchAllUrl, 'goals');
     if (full.length) scorers = full;
   }
 
-  // also assists top 3
   let assists = [];
-  const ass = (data.stats?.players || []).find(p => p.name === 'goal_assist' || /assist/i.test(p.header || ''));
-  if (ass) {
-    assists = (ass.topThree || []).map((p, i) => ({
-      id: p.id,
-      rank: p.rank ?? i + 1,
-      name: p.name,
-      teamId: p.teamId,
-      teamName: p.teamName,
-      assists: p.value,
-      photo: fotmobPhoto(p.id),
+  if (assistBlock) {
+    assists = (assistBlock.topThree || []).map((p, i) => ({
+      id: p.id, rank: p.rank ?? i + 1, name: p.name, teamId: p.teamId, teamName: p.teamName,
+      assists: p.value, photo: fotmobPhoto(p.id),
       teamLogo: p.teamId ? `https://images.fotmob.com/image_resources/logo/teamlogo/${p.teamId}_small.png` : null
     }));
+    if (assistBlock.fetchAllUrl) {
+      const full = await fetchFullStat(assistBlock.fetchAllUrl, 'assists');
+      if (full.length) assists = full;
+    }
   }
+  console.log(`[League ${id}] standings=${standings.length} scorers=${scorers.length} assists=${assists.length} fixtures=${fixtures.length}`);
 
   const meta = LEAGUES.find(l => l.id === id) || {};
   const result = {
