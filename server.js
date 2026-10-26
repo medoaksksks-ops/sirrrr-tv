@@ -1,5 +1,5 @@
 /**
- * Sir TV Live Server v3.8 — Rich details + stable streams
+ * Sir TV Live Server v3.9 — Rich details + stable streams
  */
 const express = require('express');
 const http = require('http');
@@ -7,6 +7,7 @@ const { Server } = require('socket.io');
 const cors = require('cors');
 const axios = require('axios');
 const cheerio = require('cheerio');
+const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const webpush = require('web-push');
@@ -58,7 +59,7 @@ const io = new Server(server, { cors: { origin: true }, pingInterval: 20000, pin
 let cache = {
   matches: [], live: [], finished: [], upcoming: [],
   counts: { total: 0, live: 0, finished: 0, upcoming: 0 },
-  lastUpdate: null, error: null, version: '3.8'
+  lastUpdate: null, error: null, version: '3.9'
 };
 
 const detailsCache = new Map();
@@ -137,7 +138,7 @@ async function fetchMatches() {
       if (isLiveClass || /مباشر|live|شوط|دقيقة|توقف/.test(s)) statusType = 'live';
       else if (/انتهت|انتهى|ft|نهاية/.test(s)) statusType = 'finished';
 
-      const hasStream = !!(link && (link.includes('korat') || link.includes('hes-goals') || /[?&]m=\d+/.test(link) || link.includes('watch-')));
+      const hasStream = !!(link && (/korat|hes-goals|sirftv|playerv5|n1\.sirftv/i.test(link) || link.includes('hes-goals') || /[?&]m=\d+/.test(link) || link.includes('watch-')));
 
       if (home && away) {
         matches.push({
@@ -159,7 +160,7 @@ async function fetchMatches() {
     cache = {
       matches, live, finished, upcoming,
       counts: { total: matches.length, live: live.length, finished: finished.length, upcoming: upcoming.length },
-      lastUpdate: new Date().toISOString(), error: null, version: '3.8'
+      lastUpdate: new Date().toISOString(), error: null, version: '3.9'
     };
     console.log(`[Scraper] total=${matches.length} live=${live.length}`);
     return cache;
@@ -548,157 +549,189 @@ async function fetchMatchDetails(matchLink, externalId, home, away) {
 }
 
 // ========== STREAM ==========
+
 async function resolveStream(matchLink) {
-  if (!matchLink) throw new Error('No link provided');
   const hit = streamCache.get(matchLink);
   if (hit && Date.now() - hit.ts < STREAM_TTL) return hit.data;
 
-  const headers = { 'User-Agent': UA, 'Accept-Language': 'ar,en;q=0.9', Referer: 'https://sir-tv.vip/' };
+  const headers = {
+    'User-Agent': UA,
+    Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    'Accept-Language': 'ar,en;q=0.9',
+    Referer: SOURCE
+  };
 
-  // m هو رقم الماتش الصح (والبث) — أي رقم تاني في أي iframe بنعتبره غلط ونصححه
-  const mId = (matchLink.match(/[?&]m=(\d+)/) || [])[1] || null;
-  const pId = (matchLink.match(/[?&]p=(\d+)/) || [])[1] || null;
-  const ids = mId ? [mId] : [];
-
-  let diag = '';
-  const candidates = [];
-  const addCand = u => { if (u && !candidates.includes(u)) candidates.push(u); };
-
-  // 1) أول مرشح: البلاير المبني مباشرة برقم الماتش الصح
-  if (mId) addCand(`https://n1.sirftv.com/hard/player.html?match=${mId}`);
-
-  // 2) البلاير اللي في صفحة الماتش — مع تصحيح رقم الماتش لو مختلف
-  try {
-    const page1 = await get(matchLink, { headers }, 1);
-    const direct = extractStreams(page1.data, ids);
-    if (direct.length) {
-      const result = buildResult(direct, matchLink);
-      streamCache.set(matchLink, { ts: Date.now(), data: result });
-      return result;
-    }
-    addCand(fixMatchParam(extractPlayerUrl(page1.data, matchLink, ids), mId));
-    extractLooseLinks(page1.data, matchLink).forEach(u => addCand(fixMatchParam(u, mId)));
-    const $d = cheerio.load(page1.data);
-    diag = `page1 ${page1.status} len=${String(page1.data).length} iframes=${$d('iframe').length} ` +
-      `scripts=[${$d('script[src]').map((_, el) => $d(el).attr('src')).get().slice(0, 6).join(', ')}] ` +
-      `snippet=${String(page1.data).replace(/\s+/g, ' ').slice(0, 300)}`;
-  } catch (e) {
-    console.error('[Stream] page1 failed:', e.message);
-    diag = 'page1 failed: ' + e.message;
+  let url = matchLink;
+  // 1) If sir-tv watch page — try to find korat / stream link on page
+  if (/sir-tv\.vip\/matches\//i.test(url)) {
+    const page = await get(url, { headers }, 1);
+    const html = page.data || '';
+    const found =
+      (html.match(/https?:\/\/korat\.[^"'\s]+/i) || [])[0] ||
+      (html.match(/https?:\/\/[^"'\s]*hes-goals[^"'\s]*/i) || [])[0] ||
+      (html.match(/https?:\/\/n1\.sirftv\.com[^"'\s]*/i) || [])[0];
+    if (found) url = found.replace(/&amp;/g, '&');
   }
 
-  // 3) آخر محاولة: نفس البلاير بـ p كرقم
-  if (pId) addCand(`https://n1.sirftv.com/hard/player.html?match=${pId}`);
-
-  const errors = [];
-  for (const playerUrl of candidates) {
-    try {
-      const result = await resolveFromPlayer(playerUrl, matchLink, headers, ids);
-      console.log('[Stream] OK via', playerUrl);
-      streamCache.set(matchLink, { ts: Date.now(), data: result });
-      return result;
-    } catch (e) {
-      console.error('[Stream] candidate failed:', playerUrl, '-', e.message);
-      errors.push(`${playerUrl} → ${e.message}`);
-    }
-  }
-  throw new Error('No working stream. Tried: ' + (errors.join(' | ') || 'no player url found') + ' || ' + diag);
-}
-
-// لو لينك البلاير فيه match/m/id برقم مختلف عن رقم الماتش الصح، بنستبدله
-function fixMatchParam(url, id) {
-  if (!url || !id) return url;
-  try {
+  // 2) korat.hes-goals.mov — static redirect script → n1.sirftv.com hard player
+  if (/hes-goals\.mov|korat\./i.test(url)) {
+    const page = await get(url, { headers: { ...headers, Referer: SOURCE } }, 1);
+    const html = page.data || '';
+    const hostM = html.match(/PLAYER_HOST\s*=\s*['"]([^'"]+)['"]/);
+    const playerHost = hostM ? hostM[1] : 'n1.sirftv.com';
     const u = new URL(url);
-    for (const k of ['match', 'm', 'match_id', 'id']) {
-      if (u.searchParams.has(k) && /^\d+$/.test(u.searchParams.get(k))) u.searchParams.set(k, id);
+    let mid = u.searchParams.get('m') || u.searchParams.get('match');
+    if (!mid) {
+      const pm = u.pathname.match(/(\d+)\/?$/);
+      if (pm) mid = pm[1];
     }
-    return u.href;
-  } catch (_) { return url; }
-}
-
-async function resolveFromPlayer(playerUrl, matchLink, headers, ids) {
-  const page2 = await get(playerUrl, { headers: { ...headers, Referer: matchLink } }, 1);
-  let streams = extractStreams(page2.data, ids);
-  if (streams.length) return buildResult(streams, playerUrl);
-
-  let finalPlayer = extractFinalPlayer(page2.data, playerUrl);
-  if (!finalPlayer) throw new Error('Final player not found');
-  if (!finalPlayer.startsWith('http')) finalPlayer = new URL(finalPlayer, playerUrl).href;
-
-  const page3 = await get(finalPlayer, { headers: { ...headers, Referer: playerUrl } }, 1);
-  streams = extractStreams(page3.data, ids);
-  if (!streams.length) throw new Error('No stream URL found');
-  return buildResult(streams, finalPlayer);
-}
-
-const AD_IFRAME = /doubleclick|googlesyndication|adsterra|popads|propeller|facebook\.com|youtube\.com|disqus/i;
-
-// بيدور على أي لينكات شكلها بلاير/إمبد جوه الـ HTML والـ JS (مش بس الـ iframe)
-function extractLooseLinks(html, base) {
-  const out = [];
-  const re = /(?:https?:)?\/\/[^"'\s<>\\)]+/gi;
-  for (const raw of String(html).match(re) || []) {
-    let u = raw.startsWith('//') ? 'https:' + raw : raw;
-    if (!/player|embed|stream|live|\.php|\.html/i.test(u)) continue;
-    if (/\.(png|jpe?g|webp|gif|svg|css|ico|woff2?)(\?|$)/i.test(u)) continue;
-    if (AD_IFRAME.test(u) || /googleapis|gstatic|cloudflare|jquery|bootstrap|w3\.org/i.test(u)) continue;
-    if (!out.includes(u)) out.push(u);
-    if (out.length >= 4) break;
+    if (!mid || !/^\d+$/.test(mid)) throw new Error('رقم المباراة غير صحيح في رابط البث');
+    let pid = u.searchParams.get('p') || '87351';
+    if (!/^[A-Za-z0-9]{1,32}$/.test(pid)) pid = '87351';
+    url = `https://${playerHost}/hard/2908c7d4425d${pid}.html?match=${encodeURIComponent(mid)}`;
   }
-  return out;
-}
 
-function extractPlayerUrl(html, base, ids = []) {
-  const $ = cheerio.load(html);
-  const srcs = $('iframe').map((_, el) => $(el).attr('src') || $(el).attr('data-src') || '').get()
-    .filter(Boolean)
-    .map(src => { try { return src.startsWith('http') ? src : new URL(src, base).href; } catch (_) { return null; } })
-    .filter(u => u && !AD_IFRAME.test(u));
-  const pick =
-    srcs.find(u => ids.some(i => u.includes(i))) ||
-    srcs.find(u => /sirftv|playerv|player/i.test(u)) ||
-    srcs[0];
-  if (pick) return pick;
-  const m = html.match(/https?:\/\/[^"'\s]+sirftv\.com[^"'\s]*/i);
-  return m ? m[0] : null;
-}
-
-function extractFinalPlayer(html, base) {
-  const $ = cheerio.load(html);
-  let src = $('iframe').first().attr('src');
-  if (src) return src.startsWith('http') ? src : new URL(src, base).href;
-  const m = html.match(/https?:\/\/[^"'\s]+playerv5\.php[^"'\s]*/i);
-  return m ? m[0] : null;
-}
-
-function extractStreams(html, ids = []) {
-  const set = new Set();
-  const patterns = [
-    /https?:\/\/[a-z0-9.-]+\.live--koora\.com\/[^\s"'<>]+/gi,
-    /https?:\/\/[^"'\s]+\/kooora\/[^\s"'<>]*/gi,
-    /https?:\/\/[^"'\s]+\.m3u8[^"'\s]*/gi
-  ];
-  for (const re of patterns) (html.match(re) || []).forEach(u => set.add(u.replace(/\\$/, '')));
-  const all = [...set];
-  // لو الصفحة فيها ستريمات لأكتر من ماتش، خد بس اللي فيها رقم الماتش المطلوب
-  if (ids.length) {
-    const own = all.filter(u => ids.some(i => u.includes(i)));
-    if (own.length) return own;
+  // 3) hard player page → playerv5.php
+  let playerV5 = null;
+  let matchId = null;
+  if (/playerv5\.php/i.test(url)) {
+    playerV5 = url;
+    try { matchId = new URL(url).searchParams.get('match'); } catch (_) {}
+  } else {
+    const page = await get(url, { headers: { ...headers, Referer: 'https://korat.hes-goals.mov/' } }, 1);
+    const html = page.data || '';
+    const srcM =
+      html.match(/__playerSrc\s*=\s*['"]([^'"]+)['"]/) ||
+      html.match(/https?:\/\/[^"'\\s]+playerv5\.php\?match=[^"'\\s]+/i);
+    if (srcM) {
+      playerV5 = srcM[1] || srcM[0];
+      playerV5 = playerV5.replace(/\\u0026/g, '&').replace(/&amp;/g, '&');
+    }
+    const midM = html.match(/__matchId\s*=\s*['"]?(\d+)/) || html.match(/[?&]match=(\d+)/);
+    if (midM) matchId = midM[1];
+    if (!playerV5 && matchId) {
+      // fallback known pattern (host rotates — try extract from page scripts)
+      const hostM = html.match(/https?:\/\/([a-z0-9.]+sirtv\.top)/i);
+      const host = hostM ? hostM[1] : '912acsss8af382.sirtv.top';
+      playerV5 = `https://${host}/playerv5.php?match=${matchId}&key=9f39972b67d6ce22189507d008acwc26`;
+    }
   }
-  return all;
+  if (!playerV5) throw new Error('صفحة المشغّل غير موجودة');
+
+  // 4) playerv5 — decode tabsConfig + build signed m3u8
+  const page3 = await get(playerV5, {
+    headers: { ...headers, Referer: url }
+  }, 1);
+  const html3 = page3.data || '';
+
+  const result = buildStreamsFromPlayerHtml(html3, playerV5);
+  if (!result.streamUrl) throw new Error('مفيش رابط بث متاح للمباراة دي دلوقتي');
+
+  streamCache.set(matchLink, { ts: Date.now(), data: result });
+  return result;
 }
 
-function buildResult(streams, referer) {
-  const hd = streams.find(s => /_hd|\/hd|1080|720|high/i.test(s));
-  const sd = streams.find(s => !/_hd|\/hd|1080|720|high/i.test(s)) || streams[0];
-  const chosen = hd || sd;
+function md5(s) {
+  return crypto.createHash('md5').update(s).digest('hex');
+}
+
+function buildStreamsFromPlayerHtml(html, referer) {
+  // secret for token
+  let secret = '';
+  const em = html.match(/var\s+_e\s*=\s*["']([^"']+)["']/);
+  if (em) {
+    try { secret = Buffer.from(em[1], 'base64').toString('utf8'); } catch (_) {}
+  }
+  if (!secret) secret = '9755d3e7b5b6982fe254cebbb6e678228af70e9db69faa9aab8a5c85b555328c';
+
+  // XOR decode tabsConfig
+  let cfg = null;
+  const blobM = html.match(/var\s+_0x\s*=\s*["']([^"']+)["']/);
+  const keyM = html.match(/var\s+k\s*=\s*["']([^"']+)["']/);
+  if (blobM && keyM) {
+    try {
+      const buf = Buffer.from(blobM[1], 'base64');
+      const key = keyM[1];
+      let out = '';
+      for (let i = 0; i < buf.length; i++) out += String.fromCharCode(buf[i] ^ key.charCodeAt(i % key.length));
+      cfg = JSON.parse(out);
+    } catch (e) {
+      console.error('[tabsConfig]', e.message);
+    }
+  }
+
+  // paths from tabs or data-path attrs
+  const paths = [];
+  if (cfg && Array.isArray(cfg.tabs)) {
+    for (const tab of cfg.tabs) {
+      const p = tab.mobile_path || tab.path;
+      if (p) paths.push({ path: p, name: tab.name || 'Live', type: tab.type || 'regular' });
+    }
+  }
+  const $ = cheerio.load(html);
+  $('a.tablinks, a[data-path]').each((_, el) => {
+    const p = $(el).attr('data-mobile-path') || $(el).attr('data-path');
+    if (p && !paths.some(x => x.path === p)) {
+      paths.push({ path: p, name: $(el).text().trim() || 'Live', type: $(el).attr('data-type') || 'regular' });
+    }
+  });
+
+  if (!paths.length) {
+    // last-ditch: any kooora path in html
+    const pm = html.match(/kooora\/[A-Za-z0-9_]+/g) || [];
+    [...new Set(pm)].forEach(p => paths.push({ path: p, name: 'Live', type: 'regular' }));
+  }
+
+  const domains = [];
+  if (cfg) {
+    for (const d of (cfg.activeDomains || [])) domains.push(String(d).replace(/\/?$/, '/'));
+    for (const d of (cfg.cfDomains || [])) domains.push(String(d).replace(/\/?$/, '/'));
+    if (cfg.cfPools) {
+      for (const arr of Object.values(cfg.cfPools)) {
+        for (const d of arr || []) domains.push(String(d).replace(/\/?$/, '/'));
+      }
+    }
+  }
+  if (!domains.length) {
+    domains.push(
+      'https://cdn1.foot-foot.com/',
+      'https://cdn2.foot-foot.com/',
+      'https://cdn3.foot-foot.com/'
+    );
+  }
+
+  const sid = crypto.randomBytes(16).toString('hex');
   const qualities = [];
-  if (hd) qualities.push({ label: 'HD', url: hd });
-  if (sd && sd !== hd) qualities.push({ label: 'SD', url: sd });
-  streams.forEach(s => { if (s !== hd && s !== sd) qualities.push({ label: 'ALT', url: s }); });
-  return { streamUrl: chosen, qualities, quality: hd ? 'HD' : 'SD', type: 'hls', referer, resolvedAt: new Date().toISOString() };
+  const seen = new Set();
+
+  for (const tab of paths) {
+    let p = tab.path;
+    if (!p.startsWith('kooora/')) p = 'kooora/' + p;
+    if (p.endsWith('.m3u8')) p = p.slice(0, -5);
+    const token = md5(p + sid + secret);
+    for (const dom of domains.slice(0, 6)) {
+      const streamUrl = `${dom}${p}.m3u8?token=${token}&sid=${sid}`;
+      if (seen.has(streamUrl)) continue;
+      seen.add(streamUrl);
+      qualities.push({
+        label: (tab.name || 'Live').replace(/\[flag:[^\]]+\]/g, '').trim() || 'Live',
+        url: streamUrl
+      });
+      break; // one domain per tab; proxy will retry logic not needed
+    }
+  }
+
+  // Prefer first
+  const streamUrl = qualities[0]?.url || null;
+  return {
+    streamUrl,
+    qualities: qualities.length ? qualities : (streamUrl ? [{ label: 'Auto', url: streamUrl }] : []),
+    referer: referer || 'https://912acsss8af382.sirtv.top/',
+    matchId: null
+  };
 }
+
+
 
 async function proxyHls(req, res, targetUrl, referer) {
   try {
@@ -1267,8 +1300,7 @@ app.get('/api/stream', async (req, res) => {
     const playUrl = `${host}/proxy?url=${encodeURIComponent(result.streamUrl)}&ref=${ref}`;
     res.json({
       success: true, playUrl, qualities, quality: result.quality,
-      type: 'hls', proxied: true, resolvedAt: result.resolvedAt,
-      debug: { link, player: result.referer, rawStream: result.streamUrl }
+      type: 'hls', proxied: true, resolvedAt: result.resolvedAt
     });
   } catch (e) {
     console.error('[Stream]', e.message);
@@ -1284,7 +1316,7 @@ app.get('/proxy', async (req, res) => {
 
 app.get('/health', (req, res) => {
   res.json({
-    status: 'ok', version: '3.8', uptime: process.uptime(),
+    status: 'ok', version: '3.9', uptime: process.uptime(),
     lastUpdate: cache.lastUpdate, counts: cache.counts,
     caches: { details: detailsCache.size, streams: streamCache.size }
   });
@@ -1292,7 +1324,7 @@ app.get('/health', (req, res) => {
 
 app.get('/', (req, res) => {
   res.json({
-    name: 'Sir TV Live Server', version: '3.8', status: 'running',
+    name: 'Sir TV Live Server', version: '3.9', status: 'running',
     features: ['matches', 'leagues', 'standings', 'scorers', 'fixtures', 'push-notifications', 'rich-details-fotmob', 'full-hls-proxy'],
     endpoints: {
       matches: 'GET /api/matches',
@@ -1332,6 +1364,6 @@ async function boot() {
 boot().catch(console.error);
 
 server.listen(PORT, () => {
-  console.log(`\n🔥 Sir TV Live v3.8 — port ${PORT}`);
+  console.log(`\n🔥 Sir TV Live v3.9 — port ${PORT}`);
   console.log(`   Rich details (FotMob) | Lineups | Events | Full proxy\n`);
 });
