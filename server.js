@@ -1,5 +1,5 @@
 /**
- * Sir TV Live Server v3.4 — Rich details + stable streams
+ * Sir TV Live Server v3.5 — Rich details + stable streams
  */
 const express = require('express');
 const http = require('http');
@@ -7,6 +7,7 @@ const { Server } = require('socket.io');
 const cors = require('cors');
 const axios = require('axios');
 const cheerio = require('cheerio');
+const webpush = require('web-push');
 
 const app = express();
 const server = http.createServer(app);
@@ -55,7 +56,7 @@ const io = new Server(server, { cors: { origin: true }, pingInterval: 20000, pin
 let cache = {
   matches: [], live: [], finished: [], upcoming: [],
   counts: { total: 0, live: 0, finished: 0, upcoming: 0 },
-  lastUpdate: null, error: null, version: '3.4'
+  lastUpdate: null, error: null, version: '3.5'
 };
 
 const detailsCache = new Map();
@@ -132,7 +133,7 @@ async function fetchMatches() {
     cache = {
       matches, live, finished, upcoming,
       counts: { total: matches.length, live: live.length, finished: finished.length, upcoming: upcoming.length },
-      lastUpdate: new Date().toISOString(), error: null, version: '3.4'
+      lastUpdate: new Date().toISOString(), error: null, version: '3.5'
     };
     console.log(`[Scraper] total=${matches.length} live=${live.length}`);
     return cache;
@@ -784,16 +785,52 @@ async function fetchLeagueDetails(leagueId) {
   const hit = leagueCache.get(id);
   if (hit && Date.now() - hit.ts < LEAGUE_TTL) return hit.data;
 
-  const data = await fotmobGet(`https://www.fotmob.com/api/data/leagues?id=${id}`);
+  let data = await fotmobGet(`https://www.fotmob.com/api/data/leagues?id=${id}`);
   if (!data || !data.details) throw new Error('League not found');
 
-  // table
+  // Some leagues (e.g. Egypt) have empty table on brand-new season → fallback
+  const hasTable = (d) => {
+    if (Array.isArray(d?.table) && d.table.length) return true;
+    if (Array.isArray(d?.overview?.table) && d.overview.table.length) return true;
+    return false;
+  };
+  if (!hasTable(data)) {
+    const seasons = data.allAvailableSeasons || [];
+    for (const season of seasons.slice(0, 4)) {
+      if (season === data.details?.selectedSeason) continue;
+      try {
+        const d2 = await fotmobGet(`https://www.fotmob.com/api/data/leagues?id=${id}&season=${encodeURIComponent(season)}`);
+        if (hasTable(d2)) {
+          data = d2;
+          break;
+        }
+      } catch (_) {}
+    }
+  }
+
+  // table — support top-level table OR overview.table; multi-group tables
   let standings = [];
+  let groups = [];
   try {
-    const t0 = (data.table || [])[0];
-    const rows = t0?.data?.table?.all || t0?.data?.table?.All || [];
-    standings = mapTableRows(rows);
-  } catch (_) {}
+    const tableRoot = (Array.isArray(data.table) && data.table.length)
+      ? data.table
+      : (Array.isArray(data.overview?.table) ? data.overview.table : []);
+
+    for (const t0 of tableRoot) {
+      const td = t0?.data || t0 || {};
+      const rows = td?.table?.all || td?.table?.All || (Array.isArray(td?.table) ? td.table : []);
+      const mapped = mapTableRows(rows);
+      const groupName = td.leagueName || td.groupName || t0?.leagueName || null;
+      if (mapped.length) {
+        groups.push({ name: groupName, standings: mapped });
+        standings = standings.concat(mapped);
+      }
+    }
+    // if single group, keep flat standings; if multi, prefer first or all
+    if (groups.length === 1) standings = groups[0].standings;
+  } catch (e) {
+    console.error('[table parse]', e.message);
+  }
 
   // fixtures
   let fixtures = [];
@@ -809,7 +846,7 @@ async function fetchLeagueDetails(leagueId) {
     if (full.length) scorers = full;
   }
 
-  // also assists top 3
+  // assists
   let assists = [];
   const ass = (data.stats?.players || []).find(p => p.name === 'goal_assist' || /assist/i.test(p.header || ''));
   if (ass) {
@@ -836,6 +873,7 @@ async function fetchLeagueDetails(leagueId) {
     type: meta.type || 'league',
     logo: `https://images.fotmob.com/image_resources/logo/leaguelogo/${id}.png`,
     standings,
+    groups: groups.length > 1 ? groups : undefined,
     scorers,
     assists,
     fixtures,
@@ -849,6 +887,77 @@ async function fetchLeagueDetails(leagueId) {
 
   leagueCache.set(id, { ts: Date.now(), data: result });
   return result;
+}
+
+
+
+// ========== PUSH NOTIFICATIONS ==========
+// VAPID: set env VAPID_PUBLIC_KEY + VAPID_PRIVATE_KEY in production, or auto-generate
+let VAPID = {
+  publicKey: process.env.VAPID_PUBLIC_KEY || null,
+  privateKey: process.env.VAPID_PRIVATE_KEY || null
+};
+if (!VAPID.publicKey || !VAPID.privateKey) {
+  const gen = webpush.generateVAPIDKeys();
+  VAPID.publicKey = gen.publicKey;
+  VAPID.privateKey = gen.privateKey;
+  console.log('[Push] Generated ephemeral VAPID keys (set env for persistence across restarts)');
+}
+webpush.setVapidDetails(
+  process.env.VAPID_SUBJECT || 'mailto:admin@sir-tv.local',
+  VAPID.publicKey,
+  VAPID.privateKey
+);
+
+/** @type {Map<string, {subscription: any, teams: string[], matches: string[]}>} */
+const pushSubs = new Map();
+const scoreSnapshot = new Map(); // matchKey -> score string
+
+function subKey(subscription) {
+  return subscription?.endpoint || '';
+}
+
+async function sendPushToAll(payload) {
+  const body = JSON.stringify(payload);
+  const dead = [];
+  for (const [key, entry] of pushSubs) {
+    try {
+      await webpush.sendNotification(entry.subscription, body);
+    } catch (e) {
+      if (e.statusCode === 404 || e.statusCode === 410) dead.push(key);
+      else console.error('[Push]', e.statusCode || e.message);
+    }
+  }
+  dead.forEach(k => pushSubs.delete(k));
+}
+
+function detectGoalNotifications(matches) {
+  for (const m of matches || []) {
+    if (!m || m.statusType === 'upcoming') continue;
+    const key = String(m.id || m.link || `${m.home}-${m.away}`);
+    const score = String(m.score || '').replace(/\s+/g, '');
+    if (!score || score === 'vs' || score === '-:-') continue;
+    const prev = scoreSnapshot.get(key);
+    scoreSnapshot.set(key, score);
+    if (!prev || prev === score) continue;
+    // score changed
+    const parse = (s) => {
+      const p = String(s).split(/[-:]/).map(x => parseInt(String(x).trim(), 10));
+      return [p[0] || 0, p[1] || 0];
+    };
+    const [ph, pa] = parse(prev);
+    const [ch, ca] = parse(score);
+    if (ch + ca <= ph + pa) continue; // not a new goal
+    const team = ch > ph ? m.home : m.away;
+    const title = '⚽ جوووول!';
+    const body = `${m.home} ${score} ${m.away}` + (team ? ` — ${team}` : '');
+    sendPushToAll({
+      title,
+      body,
+      tag: 'goal-' + key,
+      data: { matchId: m.id, link: m.link, home: m.home, away: m.away, score }
+    }).catch(() => {});
+  }
 }
 
 
@@ -908,6 +1017,36 @@ app.get('/api/match/details', async (req, res) => {
   }
 });
 
+
+// Push notifications
+app.get('/api/push/vapid', (req, res) => {
+  res.json({ success: true, publicKey: VAPID.publicKey });
+});
+
+app.post('/api/push/subscribe', (req, res) => {
+  const { subscription, teams, matches } = req.body || {};
+  if (!subscription || !subscription.endpoint) {
+    return res.status(400).json({ success: false, error: 'subscription required' });
+  }
+  const key = subKey(subscription);
+  pushSubs.set(key, {
+    subscription,
+    teams: Array.isArray(teams) ? teams : [],
+    matches: Array.isArray(matches) ? matches : []
+  });
+  res.json({ success: true, subscribers: pushSubs.size });
+});
+
+app.post('/api/push/unsubscribe', (req, res) => {
+  const { endpoint } = req.body || {};
+  if (endpoint) pushSubs.delete(endpoint);
+  res.json({ success: true });
+});
+
+app.get('/api/push/status', (req, res) => {
+  res.json({ success: true, subscribers: pushSubs.size, vapidConfigured: !!VAPID.publicKey });
+});
+
 app.post('/api/refresh', async (req, res) => {
   try {
     const data = await fetchMatches();
@@ -948,7 +1087,7 @@ app.get('/proxy', async (req, res) => {
 
 app.get('/health', (req, res) => {
   res.json({
-    status: 'ok', version: '3.4', uptime: process.uptime(),
+    status: 'ok', version: '3.5', uptime: process.uptime(),
     lastUpdate: cache.lastUpdate, counts: cache.counts,
     caches: { details: detailsCache.size, streams: streamCache.size }
   });
@@ -956,8 +1095,8 @@ app.get('/health', (req, res) => {
 
 app.get('/', (req, res) => {
   res.json({
-    name: 'Sir TV Live Server', version: '3.4', status: 'running',
-    features: ['matches', 'leagues', 'standings', 'scorers', 'fixtures', 'rich-details-fotmob', 'full-hls-proxy'],
+    name: 'Sir TV Live Server', version: '3.5', status: 'running',
+    features: ['matches', 'leagues', 'standings', 'scorers', 'fixtures', 'push-notifications', 'rich-details-fotmob', 'full-hls-proxy'],
     endpoints: {
       matches: 'GET /api/matches',
       leagues: 'GET /api/leagues',
@@ -980,16 +1119,22 @@ setInterval(() => {
 
 async function boot() {
   await fetchMatches();
+  // seed scores without notifying
+  for (const m of cache.matches || []) {
+    const key = String(m.id || m.link || `${m.home}-${m.away}`);
+    if (m.score) scoreSnapshot.set(key, String(m.score).replace(/\s+/g, ''));
+  }
   io.emit('matches', cache);
   setInterval(async () => {
     const d = await fetchMatches();
     io.emit('matches', d);
+    try { detectGoalNotifications(d.matches || []); } catch (_) {}
   }, 30000);
 }
 
 boot().catch(console.error);
 
 server.listen(PORT, () => {
-  console.log(`\n🔥 Sir TV Live v3.4 — port ${PORT}`);
+  console.log(`\n🔥 Sir TV Live v3.5 — port ${PORT}`);
   console.log(`   Rich details (FotMob) | Lineups | Events | Full proxy\n`);
 });
