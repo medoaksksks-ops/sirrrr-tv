@@ -560,6 +560,7 @@ async function resolveStream(matchLink) {
   const pId = (matchLink.match(/[?&]p=(\d+)/) || [])[1] || null;
   const ids = mId ? [mId] : [];
 
+  let diag = '';
   const candidates = [];
   const addCand = u => { if (u && !candidates.includes(u)) candidates.push(u); };
 
@@ -576,8 +577,14 @@ async function resolveStream(matchLink) {
       return result;
     }
     addCand(fixMatchParam(extractPlayerUrl(page1.data, matchLink, ids), mId));
+    extractLooseLinks(page1.data, matchLink).forEach(u => addCand(fixMatchParam(u, mId)));
+    const $d = cheerio.load(page1.data);
+    diag = `page1 ${page1.status} len=${String(page1.data).length} iframes=${$d('iframe').length} ` +
+      `scripts=[${$d('script[src]').map((_, el) => $d(el).attr('src')).get().slice(0, 6).join(', ')}] ` +
+      `snippet=${String(page1.data).replace(/\s+/g, ' ').slice(0, 300)}`;
   } catch (e) {
     console.error('[Stream] page1 failed:', e.message);
+    diag = 'page1 failed: ' + e.message;
   }
 
   // 3) آخر محاولة: نفس البلاير بـ p كرقم
@@ -595,7 +602,7 @@ async function resolveStream(matchLink) {
       errors.push(`${playerUrl} → ${e.message}`);
     }
   }
-  throw new Error('No working stream. Tried: ' + (errors.join(' | ') || 'no player url found'));
+  throw new Error('No working stream. Tried: ' + (errors.join(' | ') || 'no player url found') + ' || ' + diag);
 }
 
 // لو لينك البلاير فيه match/m/id برقم مختلف عن رقم الماتش الصح، بنستبدله
@@ -626,6 +633,21 @@ async function resolveFromPlayer(playerUrl, matchLink, headers, ids) {
 }
 
 const AD_IFRAME = /doubleclick|googlesyndication|adsterra|popads|propeller|facebook\.com|youtube\.com|disqus/i;
+
+// بيدور على أي لينكات شكلها بلاير/إمبد جوه الـ HTML والـ JS (مش بس الـ iframe)
+function extractLooseLinks(html, base) {
+  const out = [];
+  const re = /(?:https?:)?\/\/[^"'\s<>\\)]+/gi;
+  for (const raw of String(html).match(re) || []) {
+    let u = raw.startsWith('//') ? 'https:' + raw : raw;
+    if (!/player|embed|stream|live|\.php|\.html/i.test(u)) continue;
+    if (/\.(png|jpe?g|webp|gif|svg|css|ico|woff2?)(\?|$)/i.test(u)) continue;
+    if (AD_IFRAME.test(u) || /googleapis|gstatic|cloudflare|jquery|bootstrap|w3\.org/i.test(u)) continue;
+    if (!out.includes(u)) out.push(u);
+    if (out.length >= 4) break;
+  }
+  return out;
+}
 
 function extractPlayerUrl(html, base, ids = []) {
   const $ = cheerio.load(html);
