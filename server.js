@@ -1,5 +1,5 @@
 /**
- * Sir TV Live Server v3.6 — Rich details + stable streams
+ * Sir TV Live Server v3.8 — Rich details + stable streams
  */
 const express = require('express');
 const http = require('http');
@@ -7,6 +7,8 @@ const { Server } = require('socket.io');
 const cors = require('cors');
 const axios = require('axios');
 const cheerio = require('cheerio');
+const fs = require('fs');
+const path = require('path');
 const webpush = require('web-push');
 
 const app = express();
@@ -56,7 +58,7 @@ const io = new Server(server, { cors: { origin: true }, pingInterval: 20000, pin
 let cache = {
   matches: [], live: [], finished: [], upcoming: [],
   counts: { total: 0, live: 0, finished: 0, upcoming: 0 },
-  lastUpdate: null, error: null, version: '3.6'
+  lastUpdate: null, error: null, version: '3.8'
 };
 
 const detailsCache = new Map();
@@ -91,11 +93,34 @@ async function fetchMatches() {
       let link = $el.find('a').attr('href') || null;
       if (link && !link.startsWith('http')) link = new URL(link, SOURCE).href;
 
+      // TM1 = first team in score (left number), TM2 = second (right number)
       const home = $el.find('.TM1 .TM_Name').text().trim();
       const away = $el.find('.TM2 .TM_Name').text().trim();
       const homeLogo = $el.find('.TM1 img').attr('src') || null;
       const awayLogo = $el.find('.TM2 img').attr('src') || null;
-      const score = $el.find('.MT_Result').text().replace(/\s+/g, ' ').trim() || 'vs';
+
+      // Prefer explicit goal spans to avoid RTL text reversal
+      const goalSpans = $el.find('.MT_Result .RS-goals, .MT_Result .goals, .MT_Result span')
+        .map((_, s) => $(s).text().trim())
+        .get()
+        .filter(t => /^\d+$/.test(t));
+      let homeScore = null, awayScore = null, score = 'vs';
+      if (goalSpans.length >= 2) {
+        homeScore = parseInt(goalSpans[0], 10);
+        awayScore = parseInt(goalSpans[1], 10);
+        score = `${homeScore}-${awayScore}`;
+      } else {
+        const raw = $el.find('.MT_Result').text().replace(/\s+/g, ' ').trim();
+        const mscore = raw.match(/(\d+)\s*[-–:]\s*(\d+)/);
+        if (mscore) {
+          homeScore = parseInt(mscore[1], 10);
+          awayScore = parseInt(mscore[2], 10);
+          score = `${homeScore}-${awayScore}`;
+        } else if (raw) {
+          score = raw;
+        }
+      }
+
       const statusText = $el.find('.MT_Stat').text().trim();
       const timeRaw = $el.find('.MT_Time span, .MT_Time').first().text().trim();
       const isLiveClass = $el.hasClass('live') || $el.hasClass('now');
@@ -117,6 +142,7 @@ async function fetchMatches() {
       if (home && away) {
         matches.push({
           id, externalId, home, away, homeLogo, awayLogo, score,
+          homeScore, awayScore,
           status: statusText || (statusType === 'live' ? 'مباشر' : statusType === 'finished' ? 'انتهت' : 'لم تبدأ'),
           statusType, time: to12Hour(timeRaw), timeRaw: timeRaw || null,
           isLive: statusType === 'live', start, link, hasStream
@@ -133,7 +159,7 @@ async function fetchMatches() {
     cache = {
       matches, live, finished, upcoming,
       counts: { total: matches.length, live: live.length, finished: finished.length, upcoming: upcoming.length },
-      lastUpdate: new Date().toISOString(), error: null, version: '3.6'
+      lastUpdate: new Date().toISOString(), error: null, version: '3.8'
     };
     console.log(`[Scraper] total=${matches.length} live=${live.length}`);
     return cache;
@@ -902,7 +928,8 @@ async function fetchLeagueDetails(leagueId) {
 
 
 // ========== PUSH NOTIFICATIONS ==========
-// VAPID: set env VAPID_PUBLIC_KEY + VAPID_PRIVATE_KEY in production, or auto-generate
+const SUBS_FILE = path.join(__dirname, 'push-subs.json');
+
 let VAPID = {
   publicKey: process.env.VAPID_PUBLIC_KEY || null,
   privateKey: process.env.VAPID_PRIVATE_KEY || null
@@ -911,7 +938,7 @@ if (!VAPID.publicKey || !VAPID.privateKey) {
   const gen = webpush.generateVAPIDKeys();
   VAPID.publicKey = gen.publicKey;
   VAPID.privateKey = gen.privateKey;
-  console.log('[Push] Generated ephemeral VAPID keys (set env for persistence across restarts)');
+  console.log('[Push] Generated ephemeral VAPID keys — set VAPID_PUBLIC_KEY / VAPID_PRIVATE_KEY on Railway for stability');
 }
 webpush.setVapidDetails(
   process.env.VAPID_SUBJECT || 'mailto:admin@sir-tv.local',
@@ -921,7 +948,33 @@ webpush.setVapidDetails(
 
 /** @type {Map<string, {subscription: any, teams: string[], matches: string[]}>} */
 const pushSubs = new Map();
-const scoreSnapshot = new Map(); // matchKey -> score string
+const scoreSnapshot = new Map();
+
+function loadSubs() {
+  try {
+    if (!fs.existsSync(SUBS_FILE)) return;
+    const arr = JSON.parse(fs.readFileSync(SUBS_FILE, 'utf8'));
+    if (Array.isArray(arr)) {
+      for (const e of arr) {
+        if (e && e.subscription && e.subscription.endpoint) {
+          pushSubs.set(e.subscription.endpoint, e);
+        }
+      }
+      console.log('[Push] Loaded', pushSubs.size, 'subscriptions');
+    }
+  } catch (e) {
+    console.error('[Push] loadSubs', e.message);
+  }
+}
+function saveSubs() {
+  try {
+    const arr = [...pushSubs.values()];
+    fs.writeFileSync(SUBS_FILE, JSON.stringify(arr));
+  } catch (e) {
+    console.error('[Push] saveSubs', e.message);
+  }
+}
+loadSubs();
 
 function subKey(subscription) {
   return subscription?.endpoint || '';
@@ -930,46 +983,58 @@ function subKey(subscription) {
 async function sendPushToAll(payload) {
   const body = JSON.stringify(payload);
   const dead = [];
+  let sent = 0;
   for (const [key, entry] of pushSubs) {
     try {
-      await webpush.sendNotification(entry.subscription, body);
+      await webpush.sendNotification(entry.subscription, body, {
+        TTL: 60,
+        urgency: 'high'
+      });
+      sent++;
     } catch (e) {
-      if (e.statusCode === 404 || e.statusCode === 410) dead.push(key);
-      else console.error('[Push]', e.statusCode || e.message);
+      console.error('[Push] send fail', e.statusCode || e.message);
+      if (e.statusCode === 404 || e.statusCode === 410 || e.statusCode === 403) dead.push(key);
     }
   }
-  dead.forEach(k => pushSubs.delete(k));
+  if (dead.length) {
+    dead.forEach(k => pushSubs.delete(k));
+    saveSubs();
+  }
+  // also notify open tabs via socket
+  try { io.emit('goal', payload); } catch (_) {}
+  return sent;
 }
 
 function detectGoalNotifications(matches) {
   for (const m of matches || []) {
     if (!m || m.statusType === 'upcoming') continue;
     const key = String(m.id || m.link || `${m.home}-${m.away}`);
-    const score = String(m.score || '').replace(/\s+/g, '');
+    let score = '';
+    if (m.homeScore != null && m.awayScore != null) score = `${m.homeScore}-${m.awayScore}`;
+    else score = String(m.score || '').replace(/\s+/g, '');
     if (!score || score === 'vs' || score === '-:-') continue;
     const prev = scoreSnapshot.get(key);
     scoreSnapshot.set(key, score);
     if (!prev || prev === score) continue;
-    // score changed
     const parse = (s) => {
-      const p = String(s).split(/[-:]/).map(x => parseInt(String(x).trim(), 10));
+      const p = String(s).split(/[-–:]/).map(x => parseInt(String(x).trim(), 10));
       return [p[0] || 0, p[1] || 0];
     };
     const [ph, pa] = parse(prev);
     const [ch, ca] = parse(score);
-    if (ch + ca <= ph + pa) continue; // not a new goal
+    if (ch + ca <= ph + pa) continue;
     const team = ch > ph ? m.home : m.away;
     const title = '⚽ جوووول!';
     const body = `${m.home} ${score} ${m.away}` + (team ? ` — ${team}` : '');
-    sendPushToAll({
+    const payload = {
       title,
       body,
       tag: 'goal-' + key,
       data: { matchId: m.id, link: m.link, home: m.home, away: m.away, score }
-    }).catch(() => {});
+    };
+    sendPushToAll(payload).then(n => console.log('[Push] goal sent to', n, 'subs')).catch(() => {});
   }
 }
-
 
 // ========== ROUTES ==========
 
@@ -1033,28 +1098,71 @@ app.get('/api/push/vapid', (req, res) => {
   res.json({ success: true, publicKey: VAPID.publicKey });
 });
 
-app.post('/api/push/subscribe', (req, res) => {
-  const { subscription, teams, matches } = req.body || {};
-  if (!subscription || !subscription.endpoint) {
-    return res.status(400).json({ success: false, error: 'subscription required' });
+app.post('/api/push/subscribe', async (req, res) => {
+  try {
+    const { subscription, teams, matches } = req.body || {};
+    if (!subscription || !subscription.endpoint || !subscription.keys) {
+      return res.status(400).json({ success: false, error: 'subscription required' });
+    }
+    const key = subKey(subscription);
+    pushSubs.set(key, {
+      subscription,
+      teams: Array.isArray(teams) ? teams : [],
+      matches: Array.isArray(matches) ? matches : []
+    });
+    saveSubs();
+    res.json({ success: true, subscribers: pushSubs.size });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
   }
-  const key = subKey(subscription);
-  pushSubs.set(key, {
-    subscription,
-    teams: Array.isArray(teams) ? teams : [],
-    matches: Array.isArray(matches) ? matches : []
-  });
-  res.json({ success: true, subscribers: pushSubs.size });
 });
 
 app.post('/api/push/unsubscribe', (req, res) => {
   const { endpoint } = req.body || {};
-  if (endpoint) pushSubs.delete(endpoint);
+  if (endpoint) {
+    pushSubs.delete(endpoint);
+    saveSubs();
+  }
   res.json({ success: true });
 });
 
 app.get('/api/push/status', (req, res) => {
-  res.json({ success: true, subscribers: pushSubs.size, vapidConfigured: !!VAPID.publicKey });
+  res.json({
+    success: true,
+    subscribers: pushSubs.size,
+    vapidConfigured: !!VAPID.publicKey,
+    publicKey: VAPID.publicKey
+  });
+});
+
+// إرسال إشعار تجربة فورًا
+app.post('/api/push/test', async (req, res) => {
+  try {
+    const { subscription } = req.body || {};
+    const payload = {
+      title: '⚽ كورة لايف',
+      body: 'تم تفعيل الإشعارات بنجاح — هنبعتلك عند الجول',
+      tag: 'test-koora',
+      data: { test: true }
+    };
+    if (subscription && subscription.endpoint) {
+      await webpush.sendNotification(subscription, JSON.stringify(payload), { TTL: 60, urgency: 'high' });
+      // store it too
+      pushSubs.set(subscription.endpoint, { subscription, teams: [], matches: [] });
+      saveSubs();
+      return res.json({ success: true, sent: 1, mode: 'direct' });
+    }
+    const sent = await sendPushToAll(payload);
+    res.json({ success: true, sent, mode: 'broadcast', subscribers: pushSubs.size });
+  } catch (e) {
+    console.error('[Push test]', e.statusCode, e.body || e.message);
+    res.status(500).json({
+      success: false,
+      error: e.message,
+      statusCode: e.statusCode || null,
+      body: e.body || null
+    });
+  }
 });
 
 app.post('/api/refresh', async (req, res) => {
@@ -1097,7 +1205,7 @@ app.get('/proxy', async (req, res) => {
 
 app.get('/health', (req, res) => {
   res.json({
-    status: 'ok', version: '3.6', uptime: process.uptime(),
+    status: 'ok', version: '3.8', uptime: process.uptime(),
     lastUpdate: cache.lastUpdate, counts: cache.counts,
     caches: { details: detailsCache.size, streams: streamCache.size }
   });
@@ -1105,7 +1213,7 @@ app.get('/health', (req, res) => {
 
 app.get('/', (req, res) => {
   res.json({
-    name: 'Sir TV Live Server', version: '3.6', status: 'running',
+    name: 'Sir TV Live Server', version: '3.8', status: 'running',
     features: ['matches', 'leagues', 'standings', 'scorers', 'fixtures', 'push-notifications', 'rich-details-fotmob', 'full-hls-proxy'],
     endpoints: {
       matches: 'GET /api/matches',
@@ -1145,6 +1253,6 @@ async function boot() {
 boot().catch(console.error);
 
 server.listen(PORT, () => {
-  console.log(`\n🔥 Sir TV Live v3.6 — port ${PORT}`);
+  console.log(`\n🔥 Sir TV Live v3.8 — port ${PORT}`);
   console.log(`   Rich details (FotMob) | Lineups | Events | Full proxy\n`);
 });
