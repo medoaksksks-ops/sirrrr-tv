@@ -1,6 +1,11 @@
 /**
- * Sir TV Live Server v5.0
+ * Sir TV Live Server v5.2
  * ------------------------------------------------------------
+ * v5.2:
+ *  - الهيدرز ثابتة جوه السيرفر (Origin/Referer/UA/Accept/Cookie بتوع المصدر) — من اللوحة بتحط رابط البث بس
+ *    وممكن تتغيّر من Railway: STREAM_REFERER / STREAM_ORIGIN / STREAM_UA / STREAM_COOKIE / STREAM_ACCEPT
+ * v5.1:
+ *  - الطلب للمصدر بيتبعت بنفس هيدرز المتصفح بالظبط: Origin / Referer / User-Agent / Accept / Accept-Encoding: identity / Cookie / Connection: keep-alive
  * v5.0:
  *  - نظام بث يدوي: لوحة تحكم (admin) بتحط رابط m3u8 لكل ماتش، بيتحفظ في Firebase
  *    والسيرفر بيشغّله عبر بروكسي بنفس Referer/Origin/User-Agent. متغيرات: ADMIN_PASSWORD, FIREBASE_DB_URL, FIREBASE_SECRET
@@ -89,7 +94,7 @@ const io = new Server(server, { cors: { origin: true }, pingInterval: 20000, pin
 let cache = {
   matches: [], live: [], finished: [], upcoming: [],
   counts: { total: 0, live: 0, finished: 0, upcoming: 0 },
-  lastUpdate: null, error: null, version: '5.0'
+  lastUpdate: null, error: null, version: '5.2'
 };
 
 const detailsCache = new Map();
@@ -112,7 +117,7 @@ function to12Hour(timeStr) {
 }
 
 // ========== TIME (Africa/Cairo) ==========
-const VERSION = '5.0';
+const VERSION = '5.2';
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch (_) {}
 const envNum = (k, d) => { const v = process.env[k]; if (v === undefined || v === '') return d; const n = Number(v); return Number.isFinite(n) ? n : d; };
@@ -2164,7 +2169,7 @@ function cleanEntry(b, old) {
   return {
     key: str(b.key, 300), home: str(b.home, 80), away: str(b.away, 80),
     sources, embed: /^https?:\/\//i.test(embed) ? embed.slice(0, 600) : '',
-    referer: str(b.referer, 400), origin: str(b.origin, 200), ua: str(b.ua, 400),
+    referer: str(b.referer, 400), origin: str(b.origin, 200), ua: str(b.ua, 400), cookie: str(b.cookie, 2000).replace(/[\r\n]/g, ''), accept: str(b.accept, 300).replace(/[\r\n]/g, ''),
     mode: b.mode === 'direct' ? 'direct' : 'proxy', note: str(b.note, 200),
     created: (old && old.created) || Date.now(), updated: Date.now()
   };
@@ -2259,7 +2264,7 @@ app.post('/api/admin/test', adminAuth, async (req, res) => {
   const url = String(b.url || '');
   try {
     if (!/^https?:\/\//i.test(url) || privateHost(new URL(url).hostname)) throw new Error('رابط غير صالح');
-    const hdr = streamHeaders({ referer: b.referer, origin: b.origin, ua: b.ua });
+    const hdr = streamHeaders({ referer: b.referer, origin: b.origin, ua: b.ua, cookie: b.cookie, accept: b.accept });
     const r = await axios.get(url, { headers: hdr, timeout: 15000, responseType: 'text', validateStatus: () => true, maxContentLength: 2e6 });
     const body = String(r.data || '');
     const isM3u8 = body.trim().startsWith('#EXTM3U');
@@ -2278,13 +2283,29 @@ app.post('/api/admin/test', adminAuth, async (req, res) => {
 });
 
 // هيدرز الطلب للمصدر (نفس اللي المتصفح بيبعته)
+// هيدرز ثابتة — نفس الطلب اللي المتصفح بيبعته للمصدر (قابلة للتغيير من متغيرات Railway)
+const STREAM_DEFAULTS = {
+  referer: process.env.STREAM_REFERER || 'https://2.shootsimo.net/',
+  origin: process.env.STREAM_ORIGIN || 'https://2.shootsimo.net',
+  ua: process.env.STREAM_UA || 'Mozilla/5.0 (Linux; Android 15; CPH2591 Build/AP3A.240617.008) AppleWebKit/537.36 (KHTML, like Gecko) Jrryilw/4.0 Chrome/155.0.8059.43 Mobile Safari/537.36',
+  accept: process.env.STREAM_ACCEPT || 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.9',
+  cookie: process.env.STREAM_COOKIE || 'twk_idm_key=oTP2PN1sVaXKX64FXRcDv; TawkConnectionTime=0; twk_uuid_6a5199a020e17a1d43af9db4=%7B%22uuid%22%3A%221.1vXroIhhviNS0LXiqv0qN8nqMJ9WdftZvPq5nXlFzrhY2OC9M7aKn3D47MmK57GENy0huIqWXXJwnD3vmeAgxfuGPVINoWvxbuZ0GVvkPCGfbcGfOkEjfg2%22%2C%22version%22%3A3%2C%22domain%22%3A%22shootsimo.net%22%2C%22ts%22%3A1793134147168%7D'
+};
 function streamHeaders(e) {
-  const ref = e && e.referer;
-  let origin = e && e.origin;
-  if (!origin && ref) { try { origin = new URL(ref).origin; } catch (_) {} }
-  const h = { 'User-Agent': (e && e.ua) || UA, Accept: '*/*', 'Accept-Language': 'ar-EG,ar;q=0.9,en;q=0.8' };
-  if (origin) h.Origin = origin;
-  if (ref) h.Referer = ref; else if (origin) h.Referer = origin + '/';
+  e = e || {};
+  const ref = e.referer || (e.origin ? e.origin + '/' : STREAM_DEFAULTS.referer);
+  let origin = e.origin;
+  if (!origin) { try { origin = new URL(ref).origin; } catch (_) { origin = STREAM_DEFAULTS.origin; } }
+  const h = {
+    Origin: origin,
+    Accept: e.accept || STREAM_DEFAULTS.accept,
+    'Accept-Encoding': 'identity',
+    'User-Agent': e.ua || STREAM_DEFAULTS.ua,
+    Referer: ref,
+    Connection: 'keep-alive'
+  };
+  const ck = e.cookie || STREAM_DEFAULTS.cookie;
+  if (ck) h.Cookie = ck;
   return h;
 }
 setInterval(loadManualFromFirebase, 30 * 1000);
@@ -2575,7 +2596,7 @@ app.get('/proxy', async (req, res) => {
 
 app.get('/health', (req, res) => {
   res.json({
-    status: 'ok', version: '5.0', uptime: process.uptime(),
+    status: 'ok', version: '5.2', uptime: process.uptime(),
     lastUpdate: cache.lastUpdate, counts: cache.counts,
     caches: { details: detailsCache.size, streams: streamCache.size }
   });
@@ -2583,7 +2604,7 @@ app.get('/health', (req, res) => {
 
 app.get('/', (req, res) => {
   res.json({
-    name: 'Sir TV Live Server', version: '5.0', status: 'running',
+    name: 'Sir TV Live Server', version: '5.2', status: 'running',
     features: ['news', 'highlights', 'match-extras', 'player', 'league-follow', 'matches', 'leagues', 'standings', 'scorers', 'fixtures', 'push-notifications', 'rich-details-fotmob', 'full-hls-proxy', 'team-follow', 'ranks', 'time-fix'],
     endpoints: {
       matches: 'GET /api/matches',
