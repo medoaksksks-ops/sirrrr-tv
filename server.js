@@ -1,15 +1,21 @@
 /**
- * Sir TV Live Server v3.9.1 — الكامل مع التعديلات (دوري مصري + أخبار + انتقالات + ملخصات)
- * النسخة النهائية المنظفة
+ * Sir TV Live Server v3.9
+ * ------------------------------------------------------------
+ * v3.9:
+ *  - توقيت المباريات: تصحيح فرق الساعتين + عرض بتوقيت القاهرة
+ *      (SRC_SHIFT_MIN / START_ADJUST_MIN / DISPLAY_TZ من متغيرات Railway)
+ *  - ترتيب الفريق في دوريه: /api/ranks + homeRank/awayRank داخل /api/matches
+ *  - متابعة الفرق: /api/teams/search , /api/team/:id (المباراة الجاية + آخر النتائج)
+ *  - تفاصيل أغنى: تبديلات / كروت / أهداف لكل لاعب + دكة البدلاء + أحداث كاملة
+ *  - إشعارات: مفاتيح VAPID ثابتة، تذكير قبل المباراة، بداية، جول، نهاية
+ *  - /api/debug/time لفحص الوقت الخام من المصدر
  */
-
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
 const axios = require('axios');
 const cheerio = require('cheerio');
-const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const webpush = require('web-push');
@@ -67,6 +73,7 @@ let cache = {
 const detailsCache = new Map();
 const streamCache = new Map();
 const DETAILS_TTL = 90 * 1000;
+
 const STREAM_TTL = 45 * 1000;
 
 function to12Hour(timeStr) {
@@ -79,15 +86,106 @@ function to12Hour(timeStr) {
   const period = h >= 12 ? 'م' : 'ص';
   if (h === 0) h = 12;
   else if (h > 12) h -= 12;
-  return `\( {h}: \){min} ${period}`;
+  return `${h}:${min} ${period}`;
 }
 
+// ========== TIME (Africa/Cairo) ==========
+const VERSION = '3.9';
+const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
+try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch (_) {}
+const envNum = (k, d) => { const v = process.env[k]; if (v === undefined || v === '') return d; const n = Number(v); return Number.isFinite(n) ? n : d; };
+const TZ = process.env.DISPLAY_TZ || 'Africa/Cairo';
+// الموقع المصدر بيعرض الساعة متأخرة عن توقيت القاهرة بالدقائق دي (الافتراضي ساعتين). غيّره من Railway لو لزم.
+const SRC_SHIFT_MIN = envNum('SRC_SHIFT_MIN', 120);
+// تعديل نهائي يتطبق على كل المواعيد (احتياطي، الافتراضي 0)
+const START_ADJUST_MIN = envNum('START_ADJUST_MIN', 0);
+
+const _dtf = new Intl.DateTimeFormat('en-US', {
+  timeZone: TZ, hourCycle: 'h23', year: 'numeric', month: '2-digit', day: '2-digit',
+  hour: '2-digit', minute: '2-digit', second: '2-digit'
+});
+function tzParts(ms) {
+  const o = {};
+  for (const p of _dtf.formatToParts(new Date(ms))) o[p.type] = p.value;
+  return { y: +o.year, mo: +o.month, d: +o.day, h: (+o.hour) % 24, mi: +o.minute, s: +o.second };
+}
+function tzOffsetMin(ms) {
+  const p = tzParts(ms);
+  return (Date.UTC(p.y, p.mo - 1, p.d, p.h, p.mi, p.s) - Math.floor(ms / 1000) * 1000) / 60000;
+}
+// ساعة حائط في منطقة TZ → UTC ms
+function wallToUtc(y, mo, d, h, mi) {
+  const guess = Date.UTC(y, mo - 1, d, h, mi);
+  let t = guess - tzOffsetMin(guess) * 60000;
+  t = guess - tzOffsetMin(t) * 60000;
+  return t;
+}
+function fmtClock12(ms) {
+  const p = tzParts(ms);
+  const per = p.h >= 12 ? 'م' : 'ص';
+  let h = p.h % 12; if (h === 0) h = 12;
+  return `${h}:${String(p.mi).padStart(2, '0')} ${per}`;
+}
+function toLatinDigits(s) {
+  return String(s == null ? '' : s)
+    .replace(/[٠-٩]/g, d => '٠١٢٣٤٥٦٧٨٩'.indexOf(d))
+    .replace(/[۰-۹]/g, d => '۰۱۲۳۴۵۶۷۸۹'.indexOf(d));
+}
+function parseClock(text) {
+  const t = toLatinDigits(text);
+  const m = t.match(/(\d{1,2})\s*[:.]\s*(\d{2})\s*(ص|م|am|pm)?/i);
+  if (!m) return null;
+  let h = parseInt(m[1], 10); const mi = parseInt(m[2], 10);
+  const suf = (m[3] || '').toLowerCase();
+  if (suf === 'م' || suf === 'pm') { if (h < 12) h += 12; }
+  else if (suf === 'ص' || suf === 'am') { if (h === 12) h = 0; }
+  if (h > 23 || mi > 59) return null;
+  return { h, mi };
+}
+/**
+ * يحوّل ميعاد المصدر لـ UTC صحيح.
+ *  - لو data-start فيه منطقة زمنية صريحة (Z / +02:00 / epoch) نثق فيه.
+ *  - لو من غير منطقة، أو لو هو نص "7:00 م" بس: نضيف SRC_SHIFT_MIN ونعتبره توقيت القاهرة.
+ */
+function parseStart(attr, timeRaw, statusType) {
+  const now = Date.now();
+  const a = toLatinDigits(attr).trim();
+  if (a) {
+    if (/^\d{13}$/.test(a)) return { ms: +a, how: 'attr-epoch-ms' };
+    if (/^\d{10}$/.test(a)) return { ms: +a * 1000, how: 'attr-epoch-s' };
+    if (/(Z|[+-]\d{2}:?\d{2})$/i.test(a) && !isNaN(Date.parse(a))) return { ms: Date.parse(a), how: 'attr-iso-tz' };
+    const m = a.match(/^(\d{4})-(\d{2})-(\d{2})[T\s](\d{1,2}):(\d{2})/);
+    if (m) {
+      const q = new Date(Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5]) + SRC_SHIFT_MIN * 60000);
+      return { ms: wallToUtc(q.getUTCFullYear(), q.getUTCMonth() + 1, q.getUTCDate(), q.getUTCHours(), q.getUTCMinutes()), how: 'attr-naive+shift' };
+    }
+  }
+  const c = parseClock(timeRaw);
+  if (!c) return null;
+  const total = c.h * 60 + c.mi + SRC_SHIFT_MIN;
+  const base = tzParts(now);
+  const cands = [-1, 0, 1].map(off => {
+    const dd = new Date(Date.UTC(base.y, base.mo - 1, base.d + off, 0, total));
+    return wallToUtc(dd.getUTCFullYear(), dd.getUTCMonth() + 1, dd.getUTCDate(), dd.getUTCHours(), dd.getUTCMinutes());
+  });
+  let pick;
+  if (statusType === 'finished') {
+    pick = cands.filter(x => x <= now + 30 * 60000).pop() ?? cands[0];
+  } else if (statusType === 'live') {
+    pick = cands.slice().sort((x, y) => Math.abs(x - now) - Math.abs(y - now))[0];
+  } else {
+    pick = cands.find(x => x >= now - 3 * 3600000) ?? cands[2];
+  }
+  return { ms: pick, how: 'text+shift' };
+}
 // ========== MATCHES SCRAPER ==========
+let lastRaw = [];
 async function fetchMatches() {
   try {
     const { data } = await get(SOURCE, { headers: { Referer: SOURCE, 'Cache-Control': 'no-cache' } });
     const $ = cheerio.load(data);
     const matches = [];
+    const raw = [];
 
     $('.AY_Match').each((_, el) => {
       const $el = $(el);
@@ -95,6 +193,7 @@ async function fetchMatches() {
       let link = $el.find('a').attr('href') || null;
       if (link && !link.startsWith('http')) link = new URL(link, SOURCE).href;
 
+      // TM1 = first team in score (left number), TM2 = second (right number)
       const home = $el.find('.TM1 .TM_Name').text().trim();
       const away = $el.find('.TM2 .TM_Name').text().trim();
       const homeLogo = $el.find('.TM1 img').attr('src') || null;
@@ -108,23 +207,23 @@ async function fetchMatches() {
       if (goalSpans.length >= 2) {
         homeScore = parseInt(goalSpans[0], 10);
         awayScore = parseInt(goalSpans[1], 10);
-        score = `\( {homeScore}- \){awayScore}`;
+        score = `${homeScore}-${awayScore}`;
       } else {
-        const raw = $el.find('.MT_Result').text().replace(/\s+/g, ' ').trim();
-        const mscore = raw.match(/(\d+)\s*[-–:]\s*(\d+)/);
+        const rawS = $el.find('.MT_Result').text().replace(/\s+/g, ' ').trim();
+        const mscore = rawS.match(/(\d+)\s*[-–:]\s*(\d+)/);
         if (mscore) {
           homeScore = parseInt(mscore[1], 10);
           awayScore = parseInt(mscore[2], 10);
-          score = `\( {homeScore}- \){awayScore}`;
-        } else if (raw) {
-          score = raw;
+          score = `${homeScore}-${awayScore}`;
+        } else if (rawS) {
+          score = rawS;
         }
       }
 
       const statusText = $el.find('.MT_Stat').text().trim();
       const timeRaw = $el.find('.MT_Time span, .MT_Time').first().text().trim();
       const isLiveClass = $el.hasClass('live') || $el.hasClass('now');
-      const start = $el.attr('data-start') || null;
+      const startAttr = $el.attr('data-start') || null;
 
       let externalId = null;
       if (link) {
@@ -137,21 +236,35 @@ async function fetchMatches() {
       if (isLiveClass || /مباشر|live|شوط|دقيقة|توقف/.test(s)) statusType = 'live';
       else if (/انتهت|انتهى|ft|نهاية/.test(s)) statusType = 'finished';
 
-      const hasStream = !!(link && (/korat|hes-goals|sirftv|playerv5|n1\.sirftv/i.test(link) || link.includes('hes-goals') || /[?&]m=\d+/.test(link) || link.includes('watch-')));
+      const hasStream = !!(link && (link.includes('korat') || link.includes('hes-goals') || /[?&]m=\d+/.test(link) || link.includes('watch-')));
+
+      // الوقت: نصحّحه ونحوله لتوقيت القاهرة
+      const st = parseStart(startAttr, timeRaw, statusType);
+      const startMs = st ? st.ms + START_ADJUST_MIN * 60000 : null;
 
       if (home && away) {
+        const key = String(externalId || id || link || `${home}-${away}`);
         matches.push({
-          id, externalId, home, away, homeLogo, awayLogo, score,
+          key, id, externalId, home, away, homeLogo, awayLogo, score,
           homeScore, awayScore,
           status: statusText || (statusType === 'live' ? 'مباشر' : statusType === 'finished' ? 'انتهت' : 'لم تبدأ'),
-          statusType, time: to12Hour(timeRaw), timeRaw: timeRaw || null,
-          isLive: statusType === 'live', start, link, hasStream
+          statusType,
+          time: startMs ? fmtClock12(startMs) : to12Hour(timeRaw),
+          timeRaw: timeRaw || null,
+          isLive: statusType === 'live',
+          start: startMs ? new Date(startMs).toISOString() : null,
+          startMs: startMs || null,
+          startHow: st ? st.how : null,
+          link, hasStream
         });
+        if (raw.length < 15) raw.push({ home, away, timeRaw, startAttr, how: st ? st.how : null, startIso: startMs ? new Date(startMs).toISOString() : null, cairo: startMs ? fmtClock12(startMs) : null });
       }
     });
+    lastRaw = raw;
 
     const order = { live: 0, upcoming: 1, finished: 2 };
     matches.sort((a, b) => (order[a.statusType] ?? 3) - (order[b.statusType] ?? 3));
+    attachInfo(matches);
     const live = matches.filter(m => m.statusType === 'live');
     const finished = matches.filter(m => m.statusType === 'finished');
     const upcoming = matches.filter(m => m.statusType === 'upcoming');
@@ -159,9 +272,10 @@ async function fetchMatches() {
     cache = {
       matches, live, finished, upcoming,
       counts: { total: matches.length, live: live.length, finished: finished.length, upcoming: upcoming.length },
-      lastUpdate: new Date().toISOString(), error: null, version: '3.9'
+      lastUpdate: new Date().toISOString(), error: null, version: VERSION, tz: TZ
     };
-    console.log(`[Scraper] total=\( {matches.length} live= \){live.length}`);
+    console.log(`[Scraper] total=${matches.length} live=${live.length}`);
+    resolveInBackground(matches);
     return cache;
   } catch (err) {
     console.error('[Scraper]', err.message);
@@ -170,6 +284,7 @@ async function fetchMatches() {
     return cache;
   }
 }
+
 
 function emptyDetails() {
   return {
@@ -186,39 +301,318 @@ function emptyDetails() {
   };
 }
 
-const TEAM_EN = {
-  'برشلونة': 'Barcelona', 'barcelona': 'Barcelona', 'بارسا': 'Barcelona',
-  'ريال مدريد': 'Real Madrid', 'real madrid': 'Real Madrid',
-  'أتلتيكو مدريد': 'Atletico Madrid', 'اتليتكو مدريد': 'Atletico Madrid',
-  'إشبيلية': 'Sevilla', 'اشبيلية': 'Sevilla',
-  'أوساسونا': 'Osasuna',
-  'باريس سان جيرمان': 'Paris Saint-Germain', 'باريس': 'Paris Saint-Germain', 'psg': 'Paris Saint-Germain',
-  'أولمبيك ليون': 'Lyon', 'ليون': 'Lyon',
-  'غلطة سراي': 'Galatasaray', 'جالطة سراي': 'Galatasaray',
-  'فنربخشة': 'Fenerbahce',
-  'الأهلي': 'Al Ahly', 'الاهلي': 'Al Ahly',
-  'الغرافة': 'Al Gharafa',
-  'النصر': 'Al Nassr', 'الوصل': 'Al Wasl',
-  'الاتحاد': 'Al Ittihad', 'الهلال': 'Al Hilal',
-  'مانشستر سيتي': 'Manchester City', 'مانشستر يونايتد': 'Manchester United',
-  'ليفربول': 'Liverpool', 'آرسنال': 'Arsenal', 'تشيلسي': 'Chelsea',
-  'يوفنتوس': 'Juventus', 'ميلان': 'AC Milan', 'إنتر': 'Inter',
-  'بايرن ميونخ': 'Bayern München', 'دورتموند': 'Borussia Dortmund',
-  'نيفتشي فرغانة': 'Neftchi', 'الاتحاد': 'Al Ittihad'
-};
+// ========== NAMES: عربي ⇄ إنجليزي ==========
+const stripMarks = s => String(s || '').normalize('NFD').replace(/[̀-ͯ]/g, '');
+function normAr(s) {
+  return stripMarks(s).toLowerCase()
+    .replace(/[ً-ٰٟـ]/g, '')
+    .replace(/[أإآٱ]/g, 'ا').replace(/ى/g, 'ي').replace(/ة/g, 'ه').replace(/ؤ/g, 'و').replace(/ئ/g, 'ي')
+    .replace(/[^a-z0-9؀-ۿ]+/g, ' ').replace(/\s+/g, ' ').trim()
+    .replace(/^نادي /, '');
+}
+const stripAl = s => String(s || '').replace(/(^|\s)ال(?=\S)/g, '$1');
+function normEn(s) {
+  return stripMarks(s).toLowerCase().replace(/[^a-z0-9]+/g, ' ')
+    .replace(/\b(fc|cf|afc|sc|fk|ac)\b/g, ' ').replace(/\s+/g, ' ').trim();
+}
+// كل سطر: عربي|إنجليزي|إنجليزي بديل...
+const DICT = `
+مانشستر سيتي|Manchester City
+مانشستر يونايتد|Manchester United
+ليفربول|Liverpool
+آرسنال|Arsenal
+أرسنال|Arsenal
+تشيلسي|Chelsea
+توتنهام|Tottenham Hotspur|Tottenham
+نيوكاسل|Newcastle United|Newcastle
+أستون فيلا|Aston Villa
+برايتون|Brighton|Brighton & Hove Albion
+وست هام|West Ham United|West Ham
+إيفرتون|Everton
+فولهام|Fulham
+كريستال بالاس|Crystal Palace
+وولفرهامبتون|Wolverhampton Wanderers|Wolves
+برينتفورد|Brentford
+بورنموث|Bournemouth
+نوتنغهام فورست|Nottingham Forest
+ليدز يونايتد|Leeds United|Leeds
+ساوثهامبتون|Southampton
+ليستر سيتي|Leicester City
+سندرلاند|Sunderland
+بيرنلي|Burnley
+برشلونة|Barcelona
+بارسا|Barcelona
+ريال مدريد|Real Madrid
+أتلتيكو مدريد|Atletico Madrid|Atlético Madrid
+إشبيلية|Sevilla
+فالنسيا|Valencia
+فياريال|Villarreal
+ريال سوسيداد|Real Sociedad
+أتلتيك بلباو|Athletic Club|Athletic Bilbao
+ريال بيتيس|Real Betis|Betis
+أوساسونا|Osasuna
+جيرونا|Girona
+سيلتا فيغو|Celta Vigo|Celta
+خيتافي|Getafe
+رايو فايكانو|Rayo Vallecano
+مايوركا|Mallorca
+ألافيس|Alaves|Alavés
+لاس بالماس|Las Palmas
+إسبانيول|Espanyol
+ليغانيس|Leganes
+ليفانتي|Levante
+إلتشي|Elche
+أوفييدو|Real Oviedo|Oviedo
+يوفنتوس|Juventus
+ميلان|AC Milan|Milan
+إنتر|Inter|Inter Milan|Internazionale
+إنتر ميلان|Inter|Inter Milan|Internazionale
+نابولي|Napoli
+روما|Roma|AS Roma
+لاتسيو|Lazio
+أتالانتا|Atalanta
+فيورنتينا|Fiorentina
+بولونيا|Bologna
+تورينو|Torino
+أودينيزي|Udinese
+ساسولو|Sassuolo
+جنوى|Genoa
+كالياري|Cagliari
+ليتشي|Lecce
+هيلاس فيرونا|Hellas Verona|Verona
+بارما|Parma
+كومو|Como
+بيزا|Pisa
+كريمونيزي|Cremonese
+بايرن ميونخ|Bayern Munich|Bayern München
+بوروسيا دورتموند|Borussia Dortmund|Dortmund
+دورتموند|Borussia Dortmund|Dortmund
+باير ليفركوزن|Bayer Leverkusen|Leverkusen
+ليفركوزن|Bayer Leverkusen|Leverkusen
+لايبزيج|RB Leipzig|Leipzig
+آينتراخت فرانكفورت|Eintracht Frankfurt|Frankfurt
+شتوتجارت|VfB Stuttgart|Stuttgart
+فولفسبورج|VfL Wolfsburg|Wolfsburg
+بوروسيا مونشنجلادباخ|Borussia Monchengladbach|Mönchengladbach|Gladbach
+فرايبورج|SC Freiburg|Freiburg
+هوفنهايم|Hoffenheim|TSG Hoffenheim
+ماينز|Mainz|Mainz 05
+فيردر بريمن|Werder Bremen
+أونيون برلين|Union Berlin
+أوجسبورج|Augsburg
+هامبورج|Hamburger SV|Hamburg
+سانت باولي|St. Pauli|St Pauli
+هايدنهايم|Heidenheim
+كولن|FC Köln|Köln|Cologne
+باريس سان جيرمان|Paris Saint-Germain|Paris Saint Germain|PSG
+مارسيليا|Marseille|Olympique Marseille
+ليون|Lyon|Olympique Lyonnais
+موناكو|Monaco|AS Monaco
+ليل|Lille|LOSC Lille
+نيس|Nice|OGC Nice
+لانس|Lens|RC Lens
+رين|Rennes|Stade Rennais
+ستراسبورج|Strasbourg
+نانت|Nantes
+تولوز|Toulouse
+بريست|Brest
+لوريان|Lorient
+أنجيه|Angers
+أوكسير|Auxerre
+ميتز|Metz
+لو هافر|Le Havre
+بنفيكا|Benfica|SL Benfica
+بورتو|Porto|FC Porto
+سبورتينج لشبونة|Sporting CP|Sporting Lisbon|Sporting
+براجا|Braga|SC Braga
+أياكس|Ajax
+آيندهوفن|PSV Eindhoven|PSV
+فينورد|Feyenoord
+غلطة سراي|Galatasaray
+جالطة سراي|Galatasaray
+فنربخشة|Fenerbahce|Fenerbahçe
+بشكتاش|Besiktas|Beşiktaş
+طرابزون سبور|Trabzonspor
+سلتيك|Celtic
+رينجرز|Rangers
+كلوب بروج|Club Brugge
+أندرلخت|Anderlecht
+شاختار دونيتسك|Shakhtar Donetsk
+دينامو كييف|Dynamo Kyiv|Dynamo Kiev
+ريد بول سالزبورج|Red Bull Salzburg|Salzburg
+كوبنهاجن|Copenhagen|FC Copenhagen
+أولمبياكوس|Olympiacos
+بانثينايكوس|Panathinaikos
+سلافيا براج|Slavia Praha|Slavia Prague
+بودو جليمت|Bodo/Glimt|Bodø/Glimt
+الهلال|Al Hilal|Al-Hilal
+النصر|Al Nassr|Al-Nassr
+الاتحاد|Al Ittihad|Al-Ittihad
+الأهلي السعودي|Al Ahli|Al-Ahli|Al Ahli Jeddah|Al-Ahli Saudi
+الشباب|Al Shabab|Al-Shabab
+الاتفاق|Al Ettifaq|Al-Ettifaq
+الفتح|Al Fateh|Al-Fateh
+التعاون|Al Taawoun|Al-Taawoun
+الفيحاء|Al Fayha|Al-Fayha
+الرائد|Al Raed|Al-Raed
+الخليج|Al Khaleej|Al-Khaleej
+الأخدود|Al Okhdood|Al-Okhdood
+ضمك|Damac
+الرياض|Al Riyadh|Al-Riyadh
+العروبة|Al Orobah|Al-Orobah
+الحزم|Al Hazem|Al-Hazem
+القادسية|Al Qadsiah|Al-Qadsiah|Al-Qadisiyah
+نيوم|NEOM
+الخلود|Al Kholood|Al-Kholood
+الأهلي|Al Ahly|Al Ahly SC|Al Ahly Cairo
+الزمالك|Zamalek|Zamalek SC
+بيراميدز|Pyramids|Pyramids FC
+سيراميكا كليوباترا|Ceramica Cleopatra
+المصري|Al Masry|Al Masry SC
+الاتحاد السكندري|Al Ittihad Alexandria|Al Ittihad Alexandria Club
+الإسماعيلي|Ismaily|Ismaily SC
+سموحة|Smouha|Smouha SC
+إنبي|ENPPI|Enppi
+بتروجت|Petrojet
+فاركو|Pharco|Pharco FC
+الجونة|El Gouna|El Gouna FC
+حرس الحدود|Haras El Hodoud
+طلائع الجيش|Tala'ea El Gaish|El Gaish
+المقاولون العرب|Arab Contractors|Al Mokawloon Al Arab
+زد|ZED FC|Zed
+البنك الأهلي|National Bank of Egypt|Bank Ahly
+غزل المحلة|Ghazl El Mahalla
+مودرن سبورت|Modern Sport|Modern Future|Future FC
+وادي دجلة|Wadi Degla
+الداخلية|Al Dakhleya|Dakhleya
+الغرافة|Al Gharafa
+الوصل|Al Wasl
+العين|Al Ain
+السد|Al Sadd
+الدحيل|Al Duhail
+شباب الأهلي|Shabab Al Ahli
+الوحدة|Al Wahda
+الجزيرة|Al Jazira
+الوداد|Wydad Casablanca|Wydad AC|Wydad
+الرجاء|Raja Casablanca|Raja CA
+الجيش الملكي|AS FAR|FAR Rabat
+نهضة بركان|RS Berkane
+الترجي|Esperance Tunis|Esperance de Tunis|ES Tunis
+الإفريقي|Club Africain
+صن داونز|Mamelodi Sundowns
+أورلاندو بايرتس|Orlando Pirates
+كايزر تشيفز|Kaizer Chiefs
+إنتر ميامي|Inter Miami
+لوس أنجلوس جالاكسي|LA Galaxy
+لوس أنجلوس إف سي|Los Angeles FC|LAFC
+بوكا جونيورز|Boca Juniors
+ريفر بليت|River Plate
+فلامنجو|Flamengo
+بالميراس|Palmeiras
+مصر|Egypt
+السعودية|Saudi Arabia
+المغرب|Morocco
+تونس|Tunisia
+الجزائر|Algeria
+السنغال|Senegal
+نيجيريا|Nigeria
+الكاميرون|Cameroon
+غانا|Ghana
+كوت ديفوار|Ivory Coast|Cote d'Ivoire
+مالي|Mali
+جنوب أفريقيا|South Africa
+الأردن|Jordan
+العراق|Iraq
+الإمارات|United Arab Emirates|UAE
+قطر|Qatar
+عمان|Oman
+الكويت|Kuwait
+البحرين|Bahrain
+سوريا|Syria
+لبنان|Lebanon
+فلسطين|Palestine
+ليبيا|Libya
+السودان|Sudan
+الأرجنتين|Argentina
+البرازيل|Brazil
+أوروجواي|Uruguay
+كولومبيا|Colombia
+تشيلي|Chile
+باراجواي|Paraguay
+الإكوادور|Ecuador
+بيرو|Peru
+فرنسا|France
+ألمانيا|Germany
+إسبانيا|Spain
+إنجلترا|England
+إيطاليا|Italy
+البرتغال|Portugal
+هولندا|Netherlands
+بلجيكا|Belgium
+كرواتيا|Croatia
+سويسرا|Switzerland
+الدنمارك|Denmark
+النمسا|Austria
+تركيا|Turkey|Türkiye
+اسكتلندا|Scotland
+ويلز|Wales
+بولندا|Poland
+صربيا|Serbia
+اليابان|Japan
+كوريا الجنوبية|South Korea|Korea Republic
+إيران|Iran
+أستراليا|Australia
+أمريكا|USA|United States
+المكسيك|Mexico
+كندا|Canada`.trim().split('\n');
 
+const AR2EN = new Map();   // normAr(عربي) → [English...]
+const EN2AR = new Map();   // normEn(English) → عربي (للعرض)
+const ARS_BY_EN = new Map(); // normEn(English) → Set(كل الأسماء العربية)
+for (const line of DICT) {
+  const [ar, ...ens] = line.split('|').map(x => x.trim()).filter(Boolean);
+  if (!ar || !ens.length) continue;
+  for (const k of new Set([normAr(ar), stripAl(normAr(ar))])) {
+    const cur = AR2EN.get(k) || [];
+    for (const e of ens) if (!cur.includes(e)) cur.push(e);
+    AR2EN.set(k, cur);
+  }
+  for (const e of ens) { const k = normEn(e); if (!k) continue; if (!EN2AR.has(k)) EN2AR.set(k, ar); if (!ARS_BY_EN.has(k)) ARS_BY_EN.set(k, new Set()); ARS_BY_EN.get(k).add(ar); }
+}
+const trAr = en => EN2AR.get(normEn(en)) || en;
+function enCandidates(name) {
+  const k = normAr(name);
+  const out = [...(AR2EN.get(k) || AR2EN.get(stripAl(k)) || [])];
+  if (/[a-z]/i.test(name)) out.push(name);
+  return [...new Set(out.map(normEn).filter(Boolean))];
+}
 function teamEn(name) {
   if (!name) return '';
   const n = String(name).trim();
-  if (TEAM_EN[n]) return TEAM_EN[n];
-  if (TEAM_EN[n.toLowerCase()]) return TEAM_EN[n.toLowerCase()];
-  return n;
+  const c = AR2EN.get(normAr(n)) || AR2EN.get(stripAl(normAr(n)));
+  return c ? c[0] : n;
 }
-
-function normName(s) {
-  return String(s || '').toLowerCase().replace(/[^a-z0-9\u0600-\u06ff]+/g, ' ').trim();
+function normName(s) { return normAr(s); }
+function tokensOf(s) { return String(s || '').split(' ').filter(w => w.length > 2); }
+// تشابه اسم الفريق في الموقع (عربي) مع اسم FotMob (إنجليزي غالباً) — من 0 لـ 1
+function simTeam(siteName, ...fmNames) {
+  const ens = enCandidates(siteName);
+  const ar = normAr(siteName), ar2 = stripAl(ar);
+  let best = 0;
+  for (const raw of fmNames) {
+    if (!raw) continue;
+    const t = normEn(raw), ta = normAr(raw);
+    if (!t && !ta) continue;
+    for (const e of ens) {
+      if (t === e) best = Math.max(best, 1);
+      else if (e.length >= 4 && t.length >= 4 && (t.includes(e) || e.includes(t))) best = Math.max(best, .8);
+      else if (tokensOf(t).some(w => tokensOf(e).includes(w))) best = Math.max(best, .45);
+    }
+    if (ta === ar || stripAl(ta) === ar2) best = Math.max(best, 1);
+    else if (ar.length >= 4 && ta.length >= 4 && (ta.includes(ar) || ar.includes(ta))) best = Math.max(best, .8);
+  }
+  return best;
 }
-
 function namesMatch(a, b) {
   const x = normName(a), y = normName(b);
   if (!x || !y) return false;
@@ -233,27 +627,59 @@ function fotmobPhoto(playerId) {
   if (!playerId) return null;
   return `https://images.fotmob.com/image_resources/playerimages/${playerId}.png`;
 }
-
-function posFromId(positionId) {
-  const id = Number(positionId);
-  if (id === 0 || id === 11) return 'G';
-  if (id >= 1 && id <= 4) return 'D';
-  if (id >= 5 && id <= 8) return 'M';
-  if (id >= 9 && id <= 10) return 'F';
+function posFromId(p) {
+  const id = Number(p.positionId);
+  if (Number.isFinite(id)) {
+    if (id === 11) return 'G';
+    if (id >= 32 && id <= 59) return 'D';
+    if (id >= 60 && id <= 99) return 'M';
+    if (id >= 100) return 'F';
+    if (id === 0) return 'G';
+    if (id >= 1 && id <= 4) return 'D';
+    if (id >= 5 && id <= 8) return 'M';
+    if (id >= 9 && id <= 10) return 'F';
+  }
+  const u = p.usualPlayingPositionId;
+  if (u === 0) return 'G'; if (u === 1) return 'D'; if (u === 2) return 'M'; if (u === 3) return 'F';
   return null;
 }
-
+function perfOf(p) {
+  const perf = p.performance || {};
+  const o = { subIn: null, subOut: null, goals: 0, ownGoals: 0, assists: 0, yellow: 0, red: 0 };
+  for (const e of (perf.substitutionEvents || [])) {
+    const t = String(e.type || '').toLowerCase(), tm = e.time ?? e.minute ?? null;
+    if (t.includes('out')) o.subOut = tm; else if (t.includes('in')) o.subIn = tm;
+  }
+  for (const e of (perf.events || [])) {
+    const t = String(e.type || '').toLowerCase();
+    if (t.includes('assist')) o.assists++;
+    else if (t.includes('own')) o.ownGoals++;
+    else if (t.includes('goal')) o.goals++;
+    else if (t.includes('yellow')) o.yellow++;
+    else if (t.includes('red')) o.red++;
+  }
+  return o;
+}
+function fmtRating(r) {
+  const n = parseFloat(r);
+  return Number.isFinite(n) && n > 0 ? n.toFixed(1) : null;
+}
 function mapFotmobPlayers(list) {
   if (!Array.isArray(list)) return [];
-  return list.map(p => ({
-    id: p.id,
-    name: p.name || `${p.firstName || ''} ${p.lastName || ''}`.trim(),
-    number: p.shirtNumber != null ? String(p.shirtNumber) : null,
-    position: posFromId(p.positionId) || p.positionLabel || null,
-    rating: (p.performance && p.performance.rating) || p.rating || null,
-    captain: !!p.captain,
-    photo: fotmobPhoto(p.id)
-  })).filter(p => p.name);
+  return list.map(p => {
+    const f = perfOf(p);
+    return {
+      id: p.id,
+      name: p.name || `${p.firstName || ''} ${p.lastName || ''}`.trim(),
+      number: p.shirtNumber != null ? String(p.shirtNumber) : null,
+      position: posFromId(p) || p.positionLabel || null,
+      rating: fmtRating((p.performance && p.performance.rating) ?? p.rating),
+      captain: !!(p.isCaptain || p.captain),
+      photo: fotmobPhoto(p.id),
+      subIn: f.subIn, subOut: f.subOut,
+      goals: f.goals, ownGoals: f.ownGoals, assists: f.assists, yellow: f.yellow, red: f.red
+    };
+  }).filter(p => p.name);
 }
 
 function mapFotmobStats(periods) {
@@ -264,72 +690,287 @@ function mapFotmobStats(periods) {
     for (const s of (g.stats || [])) {
       const arr = s.stats || [];
       if (arr.length >= 2) {
-        out.push({ label: s.title || s.key || '', home: arr[0], away: arr[1] });
+        out.push({
+          label: s.title || s.key || '',
+          home: arr[0],
+          away: arr[1]
+        });
       }
     }
   }
   return out.filter(x => x.label);
 }
 
-function mapFotmobEvents(headerEvents) { return []; }
+function mapFotmobEvents(matchFacts, idName) {
+  const list = (matchFacts && matchFacts.events && matchFacts.events.events) || [];
+  const out = [];
+  for (const e of list) {
+    const type = String(e.type || '');
+    const team = e.isHome === true ? 'home' : e.isHome === false ? 'away' : '';
+    let minute = e.time != null ? String(e.time) : (e.timeStr != null ? String(e.timeStr) : null);
+    if (minute && e.overloadTime) minute += '+' + e.overloadTime;
+    const pname = (e.player && e.player.name) || e.nameStr || '';
+    if (type === 'Goal') {
+      const og = !!e.ownGoal || /own/i.test(e.goalDescription || '');
+      const assist = e.assistPlayerId && idName.get(e.assistPlayerId) || (e.assistStr ? String(e.assistStr).replace(/^assist by\s*/i, '') : '');
+      out.push({
+        minute, type: og ? 'Own goal' : 'Goal', team, player: pname, playerId: (e.player && e.player.id) || e.playerId || null,
+        detail: assist ? 'صناعة: ' + assist : '', text: pname, score: Array.isArray(e.newScore) ? e.newScore.join('-') : null
+      });
+    } else if (type === 'Card') {
+      const c = String(e.card || e.cardType || '');
+      const red = /red/i.test(c);
+      out.push({ minute, type: red ? 'Red card' : 'Yellow card', team, player: pname, playerId: (e.player && e.player.id) || null, text: pname, detail: /yellowred|second/i.test(c) ? 'إنذار ثاني' : '' });
+    } else if (type === 'Substitution') {
+      const sw = Array.isArray(e.swap) ? e.swap : [];
+      out.push({ minute, type: 'Substitution', team, _swap: sw.map(x => ({ id: x.id, name: x.name })), player: pname, playerId: (e.player && e.player.id) || null, text: '' });
+    } else if (type === 'VAR') {
+      out.push({ minute, type: 'VAR', team, player: pname, text: pname, detail: e.varText || e.decision || '' });
+    }
+  }
+  return out;
+}
+// نحدد مين دخل ومين خرج: اللي في التشكيلة الأساسية هو الخارج
+function resolveSubs(events, startersIds, subsIds) {
+  for (const e of events) {
+    if (e.type !== 'Substitution') continue;
+    const sw = e._swap || []; delete e._swap;
+    let out = null, inn = null;
+    if (sw.length >= 2) {
+      if (startersIds.has(sw[0].id) && !startersIds.has(sw[1].id)) { out = sw[0]; inn = sw[1]; }
+      else if (startersIds.has(sw[1].id) && !startersIds.has(sw[0].id)) { out = sw[1]; inn = sw[0]; }
+      else if (subsIds.has(sw[0].id)) { inn = sw[0]; out = sw[1]; }
+      else if (subsIds.has(sw[1].id)) { inn = sw[1]; out = sw[0]; }
+      else { inn = sw[0]; out = sw[1]; }
+    }
+    e.playerIn = inn ? inn.name : ''; e.playerInId = inn ? inn.id : null;
+    e.playerOut = out ? out.name : ''; e.playerOutId = out ? out.id : null;
+    e.player = e.playerIn; e.text = [e.playerIn, e.playerOut].filter(Boolean).join(' ← ');
+    e.detail = e.playerOut ? 'خرج: ' + e.playerOut : '';
+  }
+}
 
 async function fotmobGet(url) {
   const { data } = await get(url, {
-    headers: { 'User-Agent': UA, Accept: 'application/json', Referer: 'https://www.fotmob.com/' },
+    headers: {
+      'User-Agent': UA,
+      Accept: 'application/json',
+      Referer: 'https://www.fotmob.com/'
+    },
     timeout: 14000
   }, 1);
   return data;
 }
 
-function dateCandidates(startIso) {
-  const dates = [];
-  const push = (d) => {
-    const y = d.getUTCFullYear();
-    const m = String(d.getUTCMonth() + 1).padStart(2, '0');
-    const day = String(d.getUTCDate()).padStart(2, '0');
-    dates.push(`\( {y} \){m}${day}`);
-  };
-  if (startIso) {
-    const d = new Date(startIso);
-    if (!isNaN(d)) {
-      push(d);
-      const prev = new Date(d); prev.setUTCDate(prev.getUTCDate() - 1); push(prev);
-      const next = new Date(d); next.setUTCDate(next.getUTCDate() + 1); push(next);
+// ========== FOTMOB: قايمة اليوم + مطابقة المباراة ==========
+const dayCache = new Map();
+const ymd = ms => { const d = new Date(ms); return `${d.getUTCFullYear()}${String(d.getUTCMonth() + 1).padStart(2, '0')}${String(d.getUTCDate()).padStart(2, '0')}`; };
+async function fotmobDay(date) {
+  const hit = dayCache.get(date);
+  if (hit && Date.now() - hit.ts < 90 * 1000) return hit.list;
+  const data = await fotmobGet(`https://www.fotmob.com/api/data/matches?date=${date}`);
+  const list = [];
+  for (const lg of (data && data.leagues) || []) {
+    for (const m of lg.matches || []) {
+      list.push({
+        id: m.id, lgId: lg.primaryId || lg.id, lgName: lg.name,
+        home: m.home || {}, away: m.away || {},
+        utc: Date.parse((m.status && m.status.utcTime) || '') || null
+      });
     }
   }
-  const now = new Date(); push(now);
-  const yday = new Date(now); yday.setUTCDate(yday.getUTCDate() - 1); push(yday);
-  return [...new Set(dates)];
+  dayCache.set(date, { ts: Date.now(), list });
+  return list;
 }
 
-async function findFotmobMatchId(home, away, startIso) {
-  const hEn = teamEn(home);
-  const aEn = teamEn(away);
-  for (const date of dateCandidates(startIso)) {
-    try {
-      const data = await fotmobGet(`https://www.fotmob.com/api/data/matches?date=${date}`);
-      for (const lg of data.leagues || []) {
-        for (const m of lg.matches || []) {
-          const hn = m.home?.name || m.home?.longName || '';
-          const an = m.away?.name || m.away?.longName || '';
-          if (
-            (namesMatch(hn, hEn) && namesMatch(an, aEn)) ||
-            (namesMatch(hn, aEn) && namesMatch(an, hEn)) ||
-            (namesMatch(hn, home) && namesMatch(an, away))
-          ) {
-            return m.id;
-          }
-        }
-      }
-    } catch (e) {
-      console.error('[FotMob matches]', date, e.message);
+const resolveCache = new Map(); // key → { ts, r }
+const aliasLearn = new Map();   // normAr(name) → teamId
+const ALIAS_FILE = path.join(DATA_DIR, 'aliases.json');
+try {
+  if (fs.existsSync(ALIAS_FILE)) for (const [k, v] of Object.entries(JSON.parse(fs.readFileSync(ALIAS_FILE, 'utf8')))) aliasLearn.set(k, v);
+} catch (_) {}
+let aliasDirty = false;
+function learnAlias(name, id) {
+  const k = normAr(name);
+  if (!k || !id || aliasLearn.get(k) === id) return;
+  aliasLearn.set(k, id); aliasDirty = true;
+}
+setInterval(() => {
+  if (!aliasDirty) return; aliasDirty = false;
+  try { fs.writeFileSync(ALIAS_FILE, JSON.stringify(Object.fromEntries(aliasLearn))); } catch (_) {}
+}, 60 * 1000);
+
+async function resolveFotmobMatch({ home, away, startMs }) {
+  const dates = new Set();
+  const base = startMs || Date.now();
+  [-1, 0, 1].forEach(o => dates.add(ymd(base + o * 86400000)));
+  let best = null;
+  for (const date of dates) {
+    let list;
+    try { list = await fotmobDay(date); } catch (e) { console.error('[FotMob day]', date, e.message); continue; }
+    for (const f of list) {
+      const s1 = simTeam(home, f.home.name, f.home.longName), s2 = simTeam(away, f.away.name, f.away.longName);
+      const w1 = simTeam(home, f.away.name, f.away.longName), w2 = simTeam(away, f.home.name, f.home.longName);
+      const straight = s1 + s2, swapped = w1 + w2, sw = swapped > straight, sum = sw ? swapped : straight;
+      let tb = 0;
+      if (startMs && f.utc) { const dm = Math.abs(f.utc - startMs) / 60000; tb = dm <= 5 ? .4 : dm <= 120 ? .1 : 0; }
+      const total = sum + tb;
+      if (!best || total > best.total) best = { total, sum, tb, f, sw };
     }
   }
+  if (!best) return null;
+  if (!(best.sum >= 1.4 || (best.sum >= .8 && best.tb >= .4))) return null;
+  const f = best.f;
+  const r = {
+    fmId: f.id, leagueId: f.lgId, leagueName: f.lgName, swapped: best.sw,
+    homeId: best.sw ? f.away.id : f.home.id, awayId: best.sw ? f.home.id : f.away.id, strong: best.sum >= 1.4
+  };
+  if (r.strong) { learnAlias(home, r.homeId); learnAlias(away, r.awayId); }
+  return r;
+}
+async function findFotmobMatchId(home, away, startIso) {
+  const r = await resolveFotmobMatch({ home, away, startMs: startIso ? Date.parse(startIso) : null });
+  return r ? r.fmId : null;
+}
+
+let resolving = false;
+async function resolveInBackground(matches) {
+  if (resolving) return;
+  resolving = true;
+  try {
+    let changed = false;
+    for (const m of matches) {
+      if (m.statusType === 'finished' && m.startMs && Date.now() - m.startMs > 36 * 3600000) continue;
+      const c = resolveCache.get(m.key);
+      if (c && (c.r ? Date.now() - c.ts < 6 * 3600000 : Date.now() - c.ts < 3 * 60000)) continue;
+      let r = null;
+      try { r = await resolveFotmobMatch({ home: m.home, away: m.away, startMs: m.startMs }); } catch (_) {}
+      resolveCache.set(m.key, { ts: Date.now(), r });
+      if (r) changed = true;
+    }
+    if (changed) {
+      attachInfo(cache.matches);
+      try { io.emit('matches', cache); } catch (_) {}
+    }
+  } finally { resolving = false; }
+}
+
+// ========== TEAM INDEX (ids / ترتيب / مباريات) ==========
+const INDEX_TTL = 10 * 60 * 1000;
+const teamIndex = { byId: new Map(), byEn: new Map(), byAr: new Map(), builtAt: 0, building: null };
+const teamLogo = id => `https://images.fotmob.com/image_resources/logo/teamlogo/${id}_small.png`;
+async function pool(items, n, fn) {
+  let i = 0;
+  await Promise.all(Array.from({ length: Math.min(n, items.length) }, async () => {
+    while (i < items.length) { const it = items[i++]; await fn(it); }
+  }));
+}
+function putUnique(map, k, id) {
+  if (!k) return;
+  const cur = map.get(k);
+  if (cur === undefined) map.set(k, id); else if (cur !== id) map.set(k, -1);
+}
+function leagueMeta(id, fallbackName) {
+  const l = LEAGUES.find(x => x.id === Number(id));
+  return l
+    ? { id: l.id, name: l.name, nameAr: l.nameAr, logo: `https://images.fotmob.com/image_resources/logo/leaguelogo/${l.id}.png` }
+    : (id ? { id: Number(id), name: fallbackName || '', nameAr: fallbackName || '', logo: `https://images.fotmob.com/image_resources/logo/leaguelogo/${id}.png` } : null);
+}
+async function buildTeamIndex(force) {
+  if (teamIndex.building) return teamIndex.building;
+  if (!force && teamIndex.builtAt && Date.now() - teamIndex.builtAt < INDEX_TTL) return;
+  teamIndex.building = (async () => {
+    const byId = new Map(), byEn = new Map();
+    const list = LEAGUES.filter(l => !leagueBad.has(l.id));
+    await pool(list, 3, async (lg) => {
+      try {
+        const d = await fetchLeagueDetails(lg.id);
+        const flat = !d.groups;
+        for (const [i, r] of (d.standings || []).entries()) {
+          if (!r || !r.id) continue;
+          const t = byId.get(r.id) || { id: r.id, name: r.name, short: r.shortName || r.name, logo: teamLogo(r.id), domestic: null, fixtures: [] };
+          byId.set(r.id, t);
+          if (lg.type === 'league' && flat && (!t.domestic || t.domestic.leagueId === lg.id)) {
+            t.domestic = { rank: r.rank ?? i + 1, pts: r.pts, played: r.played, gd: r.goalDiff, leagueId: lg.id, leagueName: lg.name, leagueNameAr: lg.nameAr, season: d.standingsSeason || d.season };
+          }
+        }
+        for (const f of d.fixtures || []) {
+          for (const tid of [f.homeId, f.awayId]) {
+            if (!tid) continue;
+            const t = byId.get(tid) || { id: tid, name: tid === f.homeId ? f.home : f.away, short: tid === f.homeId ? f.home : f.away, logo: teamLogo(tid), domestic: null, fixtures: [] };
+            byId.set(tid, t);
+            if (!t.fixtures.some(x => x.id === f.id)) t.fixtures.push({ ...f, leagueId: lg.id, leagueNameAr: lg.nameAr });
+          }
+        }
+      } catch (e) {
+        console.error('[Index]', lg.id, e.message);
+        if (lg.verify && /not found/i.test(e.message)) leagueBad.add(lg.id);
+      }
+    });
+    for (const t of byId.values()) { putUnique(byEn, normEn(t.name), t.id); putUnique(byEn, normEn(t.short), t.id); }
+    const byAr = new Map();
+    for (const [arKey, ens] of AR2EN) for (const e of ens) { const id = byEn.get(normEn(e)); if (id && id > 0) putUnique(byAr, arKey, id); }
+    if (byId.size) { teamIndex.byId = byId; teamIndex.byEn = byEn; teamIndex.byAr = byAr; teamIndex.builtAt = Date.now(); }
+    console.log(`[Index] teams=${byId.size} ar=${byAr.size}`);
+    attachInfo(cache.matches || []);
+  })().finally(() => { teamIndex.building = null; });
+  return teamIndex.building;
+}
+function resolveTeamByName(name) {
+  if (!name) return null;
+  const k = normAr(name), k2 = stripAl(k);
+  let id = aliasLearn.get(k) ?? aliasLearn.get(k2);
+  if (id) return id;
+  id = teamIndex.byAr.get(k) ?? teamIndex.byAr.get(k2);
+  if (id && id > 0) return id;
+  for (const e of enCandidates(name)) { const x = teamIndex.byEn.get(e); if (x && x > 0) return x; }
   return null;
+}
+function rankOf(id) {
+  const t = id && teamIndex.byId.get(id);
+  if (!t || !t.domestic) return null;
+  const d = t.domestic;
+  return { rank: d.rank, pts: d.pts, played: d.played, gd: d.gd, leagueId: d.leagueId, league: d.leagueNameAr || d.leagueName };
+}
+function attachInfo(matches) {
+  for (const m of matches || []) {
+    const c = resolveCache.get(m.key), r = c && c.r;
+    const hid = (r && r.homeId) || resolveTeamByName(m.home);
+    const aid = (r && r.awayId) || resolveTeamByName(m.away);
+    m.homeId = hid || null; m.awayId = aid || null;
+    m.homeRank = rankOf(hid); m.awayRank = rankOf(aid);
+    m.league = r ? leagueMeta(r.leagueId, r.leagueName) : null;
+  }
+}
+function teamArName(t) { return trAr(t.short || t.name); }
+function teamAliasesAr(t) {
+  const s = new Set();
+  for (const n of [t.name, t.short]) { const k = normEn(n); (ARS_BY_EN.get(k) || []).forEach(x => s.add(x)); }
+  for (const [k, id] of aliasLearn) if (id === t.id) s.add(k);
+  return [...s];
+}
+function fxOutcome(f, teamId) {
+  const m = String(f.score || '').match(/(\d+)\s*[-–:]\s*(\d+)/);
+  if (!m) return null;
+  const a = +m[1], b = +m[2], home = f.homeId === teamId;
+  const my = home ? a : b, op = home ? b : a;
+  return my > op ? 'W' : my < op ? 'L' : 'D';
+}
+function teamSummary(t) {
+  const now = Date.now();
+  const fx = t.fixtures.map(f => ({ ...f, ts: Date.parse(f.utcTime) || 0, homeAr: trAr(f.home), awayAr: trAr(f.away) }));
+  const upcoming = fx.filter(f => f.statusType !== 'finished').sort((a, b) => a.ts - b.ts).slice(0, 6);
+  const results = fx.filter(f => f.statusType === 'finished').sort((a, b) => b.ts - a.ts).slice(0, 6).map(f => ({ ...f, outcome: fxOutcome(f, t.id) }));
+  return {
+    id: t.id, name: t.name, nameAr: teamArName(t), logo: t.logo, aliases: teamAliasesAr(t),
+    rank: t.domestic ? { rank: t.domestic.rank, pts: t.domestic.pts, played: t.domestic.played, gd: t.domestic.gd, leagueId: t.domestic.leagueId, league: t.domestic.leagueNameAr } : null,
+    next: upcoming[0] || null, upcoming, results, form: results.slice(0, 5).map(r => r.outcome).filter(Boolean).join(''), now
+  };
 }
 
 async function enrichFromFotmob(details, home, away, startIso) {
-  const matchId = await findFotmobMatchId(home, away, startIso);
+  const rm = await resolveFotmobMatch({ home, away, startMs: startIso ? Date.parse(startIso) : null });
+  const matchId = rm && rm.fmId;
   if (!matchId) return false;
 
   const data = await fotmobGet(`https://www.fotmob.com/api/data/matchDetails?matchId=${matchId}`);
@@ -339,13 +980,13 @@ async function enrichFromFotmob(details, home, away, startIso) {
   details.fotmobId = matchId;
 
   const content = data.content;
-  const infoBox = content.matchFacts?.infoBox || {};
+  const infoBox = (content.matchFacts && content.matchFacts.infoBox) || {};
   const stadium = infoBox.Stadium || {};
   const referee = infoBox.Referee || {};
   const tournament = infoBox.Tournament || {};
 
   details.info = {
-    competition: tournament.leagueName || data.general?.leagueName || null,
+    competition: tournament.leagueName || (data.general && data.general.leagueName) || null,
     round: tournament.roundName || tournament.round || null,
     stadium: stadium.name || null,
     city: stadium.city || null,
@@ -354,7 +995,7 @@ async function enrichFromFotmob(details, home, away, startIso) {
     attendance: infoBox.Attendance || null,
     referee: referee.text || referee.name || null,
     refereeCountry: referee.country || null,
-    date: infoBox['Match Date']?.utcTime || data.general?.matchTimeUTC || null,
+    date: (infoBox['Match Date'] && infoBox['Match Date'].utcTime) || (data.general && data.general.matchTimeUTC) || null,
     home: data.header?.teams?.[0]?.name || home,
     away: data.header?.teams?.[1]?.name || away,
     homeScore: data.header?.teams?.[0]?.score,
@@ -381,51 +1022,86 @@ async function enrichFromFotmob(details, home, away, startIso) {
 
   details.stats = mapFotmobStats(content.stats?.Periods);
 
-  const ev = content.matchFacts?.events || {};
-  const headerEv = data.header?.events || {};
-  const events = [];
-  for (const side of ['homeTeamGoals', 'awayTeamGoals']) {
-    const bag = headerEv[side] || {};
-    for (const [playerName, arr] of Object.entries(bag)) {
-      for (const g of arr || []) {
-        events.push({
-          minute: g.time != null ? String(g.time) : null,
-          type: g.type || 'Goal',
-          player: g.player?.name || playerName,
-          team: side.startsWith('home') ? 'home' : 'away',
-          detail: g.assistStr || '',
-          text: g.player?.name || playerName
-        });
-      }
-    }
-  }
-  for (const side of ['homeTeamRedCards', 'awayTeamRedCards']) {
-    const bag = headerEv[side] || {};
-    for (const [playerName, arr] of Object.entries(bag)) {
-      for (const c of arr || []) {
-        events.push({
-          minute: c.time != null ? String(c.time) : null,
-          type: 'Red card',
-          player: playerName,
-          team: side.startsWith('home') ? 'home' : 'away',
-          text: playerName
-        });
-      }
-    }
-  }
-  if (events.length) {
-    events.sort((a, b) => (parseInt(a.minute) || 0) - (parseInt(b.minute) || 0));
-    details.events = events;
-  }
+  // ---- الأحداث الكاملة (أهداف / كروت / تبديلات / VAR) ----
+  const all = [...details.homeLineup, ...details.awayLineup, ...details.homeSubs, ...details.awaySubs];
+  const byId = new Map(all.map(p => [p.id, p]));
+  const idName = new Map(all.map(p => [p.id, p.name]));
+  const startersIds = new Set([...details.homeLineup, ...details.awayLineup].map(p => p.id));
+  const subsIds = new Set([...details.homeSubs, ...details.awaySubs].map(p => p.id));
+  let events = mapFotmobEvents(content.matchFacts, idName);
+  resolveSubs(events, startersIds, subsIds);
 
+  if (!events.length) {
+    const headerEv = data.header?.events || {};
+    for (const side of ['homeTeamGoals', 'awayTeamGoals']) {
+      for (const [playerName, arr] of Object.entries(headerEv[side] || {})) {
+        for (const g of arr || []) {
+          events.push({
+            minute: g.time != null ? String(g.time) : null, type: g.type || 'Goal',
+            player: g.player?.name || playerName, team: side.startsWith('home') ? 'home' : 'away',
+            detail: g.assistStr || '', text: g.player?.name || playerName
+          });
+        }
+      }
+    }
+    for (const side of ['homeTeamRedCards', 'awayTeamRedCards']) {
+      for (const [playerName, arr] of Object.entries(headerEv[side] || {})) {
+        for (const c of arr || []) {
+          events.push({ minute: c.time != null ? String(c.time) : null, type: 'Red card', player: playerName, team: side.startsWith('home') ? 'home' : 'away', text: playerName });
+        }
+      }
+    }
+  }
+  events.forEach((e, i) => { e.n = i; });
+
+  // ---- نطبّق الأحداث على اللاعبين (تبديل/أهداف/كروت) لو لسه مفيش من performance ----
+  const mnum = x => { const n = parseInt(x, 10); return Number.isFinite(n) ? n : null; };
+  const cnt = { g: new Map(), og: new Map(), y: new Map(), r: new Map(), a: new Map() };
+  const inc = (m, id) => { if (id != null) m.set(id, (m.get(id) || 0) + 1); };
+  for (const e of events) {
+    if (e.type === 'Substitution') {
+      const pi = byId.get(e.playerInId), po = byId.get(e.playerOutId);
+      if (pi && pi.subIn == null) pi.subIn = mnum(e.minute);
+      if (po && po.subOut == null) po.subOut = mnum(e.minute);
+    } else if (e.type === 'Goal') inc(cnt.g, e.playerId);
+    else if (e.type === 'Own goal') inc(cnt.og, e.playerId);
+    else if (e.type === 'Yellow card') inc(cnt.y, e.playerId);
+    else if (e.type === 'Red card') inc(cnt.r, e.playerId);
+  }
+  for (const p of all) {
+    p.goals = Math.max(p.goals || 0, cnt.g.get(p.id) || 0);
+    p.ownGoals = Math.max(p.ownGoals || 0, cnt.og.get(p.id) || 0);
+    p.yellow = Math.max(p.yellow || 0, cnt.y.get(p.id) || 0);
+    p.red = Math.max(p.red || 0, cnt.r.get(p.id) || 0);
+  }
+  details.events = events;
+
+  // ---- ترتيب الفريقين ----
+  const hid = rm.homeId, aid = rm.awayId;
+  if (rm.swapped) swapDetails(details);
+  details.ids = { home: hid || null, away: aid || null };
+  details.ranks = { home: rankOf(hid), away: rankOf(aid) };
   return true;
 }
 
+// لو الموقع عارض الفريقين بترتيب عكس FotMob نقلب الجهات عشان تطابق كروت الموقع
+function swapDetails(d) {
+  [d.homeLineup, d.awayLineup] = [d.awayLineup, d.homeLineup];
+  [d.homeSubs, d.awaySubs] = [d.awaySubs, d.homeSubs];
+  const f = d.formations || {};
+  d.formations = { ...f, home: f.away, away: f.home, homeCoach: f.awayCoach, awayCoach: f.homeCoach, homeCoachPhoto: f.awayCoachPhoto, awayCoachPhoto: f.homeCoachPhoto };
+  d.stats = (d.stats || []).map(s => ({ label: s.label, home: s.away, away: s.home }));
+  d.events = (d.events || []).map(e => ({ ...e, team: e.team === 'home' ? 'away' : e.team === 'away' ? 'home' : e.team }));
+  const i = d.info || {};
+  d.info = { ...i, home: i.away, away: i.home, homeScore: i.awayScore, awayScore: i.homeScore };
+}
+
+// keep sportscore as weak fallback for lineups only
 async function enrichFromSportScore(details, home, away) {
   try {
     const h = teamEn(home).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
     const a = teamEn(away).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
-    const slugs = [`\( {h}-vs- \){a}`, `\( {a}-vs- \){h}`, `fc-\( {h}-vs- \){a}`, `\( {h}-vs-fc- \){a}`];
+    const slugs = [`${h}-vs-${a}`, `${a}-vs-${h}`, `fc-${h}-vs-${a}`, `${h}-vs-fc-${a}`];
     for (const slug of [...new Set(slugs)]) {
       try {
         const { data } = await get(
@@ -497,7 +1173,7 @@ async function fetchMatchDetails(matchLink, externalId, home, away) {
     if (m) startIso = m.start || null;
   }
 
-  const key = String(externalId || matchLink || `\( {home}- \){away}`);
+  const key = String(externalId || matchLink || `${home}-${away}`);
   const hit = detailsCache.get(key);
   if (hit && Date.now() - hit.ts < DETAILS_TTL) return hit.data;
 
@@ -511,6 +1187,7 @@ async function fetchMatchDetails(matchLink, externalId, home, away) {
     }
   }
 
+  // fallback
   if (!details.homeLineup.length && home && away) {
     await enrichFromSportScore(details, home, away);
   }
@@ -523,141 +1200,79 @@ async function fetchMatchDetails(matchLink, externalId, home, away) {
   return details;
 }
 
-// ========== STREAM (الإصلاح الرئيسي) ==========
+// ========== STREAM ==========
 async function resolveStream(matchLink) {
+  if (!matchLink) throw new Error('No link provided');
   const hit = streamCache.get(matchLink);
   if (hit && Date.now() - hit.ts < STREAM_TTL) return hit.data;
 
-  const headers = {
-    'User-Agent': UA,
-    Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-    'Accept-Language': 'ar,en;q=0.9',
-    Referer: SOURCE
-  };
+  const headers = { 'User-Agent': UA, 'Accept-Language': 'ar,en;q=0.9', Referer: 'https://sir-tv.vip/' };
 
-  let url = matchLink;
+  const page1 = await get(matchLink, { headers }, 1);
+  let playerUrl = extractPlayerUrl(page1.data, matchLink);
+  if (!playerUrl) {
+    const mid = matchLink.match(/[?&]m=(\d+)/);
+    if (mid) playerUrl = `https://n1.sirftv.com/hard/player.html?match=${mid[1]}`;
+  }
+  if (!playerUrl) throw new Error('Player page not found');
 
-  // 1) صفحة static أو new format (حل المشكلة الرئيسية)
-  const page = await get(url, { headers: { ...headers, Referer: SOURCE } }, 2);
-  const html = page.data || '';
-
-  let playerV5 = null;
-  let matchId = null;
-
-  // حاول النوع الجديد لدعم korat.hes-goals.mov
-  const hostM = html.match(/PLAYER_HOST\s*=\s*['"]([^'"]+)['"]/);
-  if (hostM) {
-    const mid = matchLink.match(/m=(\d+)/) ? matchLink.match(/m=(\d+)/)[1] : null;
-    if (mid) playerV5 = `https://\( {hostM[1]}/hard/2908c7d4425d \){matchLink.match(/p=(\d+)/) ? matchLink.match(/p=(\d+)/)[1] : '87351'}.html?match=${encodeURIComponent(mid)}`;
+  const page2 = await get(playerUrl, { headers: { ...headers, Referer: matchLink } }, 1);
+  let streams = extractStreams(page2.data);
+  if (streams.length) {
+    const result = buildResult(streams, playerUrl);
+    streamCache.set(matchLink, { ts: Date.now(), data: result });
+    return result;
   }
 
-  if (!playerV5) {
-    // fallback لـ n1.sirftv
-    playerV5 = `https://n1.sirftv.com/hard/2908c7d4425d87351.html?match=4763765`;
-  }
+  let finalPlayer = extractFinalPlayer(page2.data, playerUrl);
+  if (!finalPlayer) throw new Error('Final player not found');
+  if (!finalPlayer.startsWith('http')) finalPlayer = new URL(finalPlayer, playerUrl).href;
 
-  if (!playerV5) throw new Error('صفحة المشغّل غير موجودة');
+  const page3 = await get(finalPlayer, { headers: { ...headers, Referer: playerUrl } }, 1);
+  streams = extractStreams(page3.data);
+  if (!streams.length) throw new Error('No stream URL found');
 
-  // 2) buildStreamsFromPlayerHtml
-  const result = buildStreamsFromPlayerHtml(html, url);
-
+  const result = buildResult(streams, finalPlayer);
   streamCache.set(matchLink, { ts: Date.now(), data: result });
   return result;
 }
 
-function md5(s) {
-  return crypto.createHash('md5').update(s).digest('hex');
+function extractPlayerUrl(html, base) {
+  const $ = cheerio.load(html);
+  const iframe = $('iframe#player, iframe[src*="sirftv"], iframe[src*="playerv"], iframe[src*="player"], iframe').first().attr('src');
+  if (iframe) return iframe.startsWith('http') ? iframe : new URL(iframe, base).href;
+  const m = html.match(/https?:\/\/[^"'\s]+sirftv\.com[^"'\s]*/i);
+  return m ? m[0] : null;
 }
 
-function buildStreamsFromPlayerHtml(html, referer) {
-  let secret = '';
-  const em = html.match(/var\s+_e\s*=\s*["']([^"']+)["']/);
-  if (em) {
-    try { secret = Buffer.from(em[1], 'base64').toString('utf8'); } catch (_) {}
-  }
-  if (!secret) secret = '9755d3e7b5b6982fe254cebbb6e678228af70e9db69faa9aab8a5c85b555328c';
-
-  let cfg = null;
-  const blobM = html.match(/var\s+_0x\s*=\s*["']([^"']+)["']/);
-  const keyM = html.match(/var\s+k\s*=\s*["']([^'"]+)["']/);
-  if (blobM && keyM) {
-    try {
-      const buf = Buffer.from(blobM[1], 'base64');
-      const key = keyM[1];
-      let out = '';
-      for (let i = 0; i < buf.length; i++) out += String.fromCharCode(buf[i] ^ key.charCodeAt(i % key.length));
-      cfg = JSON.parse(out);
-    } catch (e) {
-      console.error('[tabsConfig]', e.message);
-    }
-  }
-
-  const paths = [];
-  if (cfg && Array.isArray(cfg.tabs)) {
-    for (const tab of cfg.tabs) {
-      const p = tab.mobile_path || tab.path;
-      if (p) paths.push({ path: p, name: tab.name || 'Live', type: tab.type || 'regular' });
-    }
-  }
+function extractFinalPlayer(html, base) {
   const $ = cheerio.load(html);
-  $('a.tablinks, a[data-path]').each((_, el) => {
-    const p = $(el).attr('data-mobile-path') || $(el).attr('data-path');
-    if (p && !paths.some(x => x.path === p)) {
-      paths.push({ path: p, name: $(el).text().trim() || 'Live', type: $(el).attr('data-type') || 'regular' });
-    }
-  });
+  let src = $('iframe').first().attr('src');
+  if (src) return src.startsWith('http') ? src : new URL(src, base).href;
+  const m = html.match(/https?:\/\/[^"'\s]+playerv5\.php[^"'\s]*/i);
+  return m ? m[0] : null;
+}
 
-  if (!paths.length) {
-    const pm = html.match(/kooora\/[A-Za-z0-9_]+/g) || [];
-    [...new Set(pm)].forEach(p => paths.push({ path: p, name: 'Live', type: 'regular' }));
-  }
+function extractStreams(html) {
+  const set = new Set();
+  const patterns = [
+    /https?:\/\/[a-z0-9.-]+\.live--koora\.com\/[^\s"'<>]+/gi,
+    /https?:\/\/[^"'\s]+\/kooora\/[^\s"'<>]*/gi,
+    /https?:\/\/[^"'\s]+\.m3u8[^"'\s]*/gi
+  ];
+  for (const re of patterns) (html.match(re) || []).forEach(u => set.add(u.replace(/\\$/, '')));
+  return [...set];
+}
 
-  const domains = [];
-  if (cfg) {
-    for (const d of (cfg.activeDomains || [])) domains.push(String(d).replace(/\/?$/, '/'));
-    for (const d of (cfg.cfDomains || [])) domains.push(String(d).replace(/\/?$/, '/'));
-    if (cfg.cfPools) {
-      for (const arr of Object.values(cfg.cfPools)) {
-        for (const d of arr || []) domains.push(String(d).replace(/\/?$/, '/'));
-      }
-    }
-  }
-  if (!domains.length) {
-    domains.push(
-      'https://cdn1.foot-foot.com/',
-      'https://cdn2.foot-foot.com/',
-      'https://cdn3.foot-foot.com/'
-    );
-  }
-
-  const sid = crypto.randomBytes(16).toString('hex');
+function buildResult(streams, referer) {
+  const hd = streams.find(s => /_hd|\/hd|1080|720|high/i.test(s));
+  const sd = streams.find(s => !/_hd|\/hd|1080|720|high/i.test(s)) || streams[0];
+  const chosen = hd || sd;
   const qualities = [];
-  const seen = new Set();
-
-  for (const tab of paths) {
-    let p = tab.path;
-    if (!p.startsWith('kooora/')) p = 'kooora/' + p;
-    if (p.endsWith('.m3u8')) p = p.slice(0, -5);
-    const token = md5(p + sid + secret);
-    for (const dom of domains.slice(0, 6)) {
-      const streamUrl = `\( {dom} \){p}.m3u8?token=\( {token}&sid= \){sid}`;
-      if (seen.has(streamUrl)) continue;
-      seen.add(streamUrl);
-      qualities.push({
-        label: (tab.name || 'Live').replace(/\[flag:[^\]]+\]/g, '').trim() || 'Live',
-        url: streamUrl
-      });
-      break;
-    }
-  }
-
-  const streamUrl = qualities[0]?.url || null;
-  return {
-    streamUrl,
-    qualities: qualities.length ? qualities : (streamUrl ? [{ label: 'Auto', url: streamUrl }] : []),
-    referer: referer || 'https://912acsss8af382.sirtv.top/',
-    matchId: null
-  };
+  if (hd) qualities.push({ label: 'HD', url: hd });
+  if (sd && sd !== hd) qualities.push({ label: 'SD', url: sd });
+  streams.forEach(s => { if (s !== hd && s !== sd) qualities.push({ label: 'ALT', url: s }); });
+  return { streamUrl: chosen, qualities, quality: hd ? 'HD' : 'SD', type: 'hls', referer, resolvedAt: new Date().toISOString() };
 }
 
 async function proxyHls(req, res, targetUrl, referer) {
@@ -688,11 +1303,11 @@ async function proxyHls(req, res, targetUrl, referer) {
     if (isPlaylist) {
       let body = Buffer.from(response.data).toString('utf8');
       const base = new URL(targetUrl);
-      const host = `\( {req.protocol}:// \){req.get('host')}`;
+      const host = `${req.protocol}://${req.get('host')}`;
       const proxyBase = `${host}/proxy?url=`;
       const refQ = referer ? `&ref=${encodeURIComponent(referer)}` : '';
       body = body.replace(/(https?:\/\/[^\s\n\r"']+)/g, m => proxyBase + encodeURIComponent(m) + refQ);
-      body = body.replace(/^([a-zA-z0-9_\-\.\/]+\.(ts|m4s|key|m3u8)[^\s]*)$/gm, m => {
+      body = body.replace(/^([a-zA-Z0-9_\-\.\/]+\.(ts|m4s|key|m3u8)[^\s]*)$/gm, m => {
         try { return proxyBase + encodeURIComponent(new URL(m, base).href) + refQ; } catch { return m; }
       });
       res.set('Content-Type', 'application/vnd.apple.mpegurl');
@@ -707,9 +1322,11 @@ async function proxyHls(req, res, targetUrl, referer) {
   }
 }
 
-// ========== LEAGUES + الجديد (أخبار + انتقالات + ملخصات) ==========
+
+// ========== LEAGUES (FotMob) ==========
 const leagueCache = new Map();
 const LEAGUE_TTL = 5 * 60 * 1000;
+const leagueBad = new Set();
 
 const LEAGUES = [
   { id: 519, name: 'Egyptian Premier League', nameAr: 'الدوري المصري', country: 'Egypt', type: 'league' },
@@ -718,6 +1335,10 @@ const LEAGUES = [
   { id: 55, name: 'Serie A', nameAr: 'الدوري الإيطالي', country: 'Italy', type: 'league' },
   { id: 54, name: 'Bundesliga', nameAr: 'الدوري الألماني', country: 'Germany', type: 'league' },
   { id: 53, name: 'Ligue 1', nameAr: 'الدوري الفرنسي', country: 'France', type: 'league' },
+  { id: 536, name: 'Saudi Pro League', nameAr: 'الدوري السعودي', country: 'Saudi Arabia', type: 'league', verify: true },
+  { id: 71, name: 'Süper Lig', nameAr: 'الدوري التركي', country: 'Turkey', type: 'league', verify: true },
+  { id: 61, name: 'Liga Portugal', nameAr: 'الدوري البرتغالي', country: 'Portugal', type: 'league', verify: true },
+  { id: 57, name: 'Eredivisie', nameAr: 'الدوري الهولندي', country: 'Netherlands', type: 'league', verify: true },
   { id: 42, name: 'Champions League', nameAr: 'دوري أبطال أوروبا', country: 'Europe', type: 'cup' },
   { id: 73, name: 'Europa League', nameAr: 'الدوري الأوروبي', country: 'Europe', type: 'cup' },
   { id: 526, name: 'CAF Champions League', nameAr: 'دوري أبطال أفريقيا', country: 'Africa', type: 'cup' },
@@ -786,7 +1407,7 @@ function mapScorers(playersStats) {
       rank: p.rank ?? p.Rank ?? list.length + 1,
       name: p.name || p.ParticipantName,
       teamId: p.teamId || p.TeamId,
-      teamName: p.TeamName || p.teamName,
+      teamName: p.teamName || p.TeamName,
       goals: p.value ?? p.StatValue ?? p.stat?.value ?? null,
       photo: fotmobPhoto(id),
       teamLogo: (p.teamId || p.TeamId) ? `https://images.fotmob.com/image_resources/logo/teamlogo/${p.teamId || p.TeamId}_small.png` : null
@@ -848,31 +1469,38 @@ async function fetchLeagueDetails(leagueId) {
   const hit = leagueCache.get(id);
   if (hit && Date.now() - hit.ts < LEAGUE_TTL) return hit.data;
 
+  // Prefer latest season (e.g. Egypt 2026/2027)
   let data = await fotmobGet(`https://www.fotmob.com/api/data/leagues?id=${id}`);
   if (!data || !data.details) throw new Error('League not found');
   const seasons = data.allAvailableSeasons || [];
   const latest = seasons[0] || data.details.selectedSeason;
   if (latest && data.details.selectedSeason !== latest) {
     try {
-      const dLatest = await fotmobGet(`https://www.fotmob.com/api/data/leagues?id=\( {id}&season= \){encodeURIComponent(latest)}`);
+      const dLatest = await fotmobGet(`https://www.fotmob.com/api/data/leagues?id=${id}&season=${encodeURIComponent(latest)}`);
       if (dLatest && dLatest.details) data = dLatest;
     } catch (_) {}
   }
 
+  const hasTable = (d) => {
+    if (Array.isArray(d?.table) && d.table.length) return true;
+    if (Array.isArray(d?.overview?.table) && d.overview.table.length) return true;
+    return false;
+  };
+
+  // Keep latest season as primary; only borrow standings from previous season if empty
   let standingsSeason = data.details?.selectedSeason || latest || null;
   let standingsSource = data;
-  const hasTable = (d) => (Array.isArray(d?.table) && d.table.length) || (Array.isArray(d?.overview?.table) && d.overview.table.length);
-
   if (!hasTable(data)) {
     for (const season of seasons.slice(0, 5)) {
       if (season === standingsSeason) continue;
       try {
-        const d2 = await fotmobGet(`https://www.fotmob.com/api/data/leagues?id=\( {id}&season= \){encodeURIComponent(season)}`);
+        const d2 = await fotmobGet(`https://www.fotmob.com/api/data/leagues?id=${id}&season=${encodeURIComponent(season)}`);
         if (hasTable(d2)) { standingsSource = d2; break; }
       } catch (_) {}
     }
   }
 
+  // table — support top-level table OR overview.table; multi-group tables
   let standings = [];
   let groups = [];
   try {
@@ -891,16 +1519,19 @@ async function fetchLeagueDetails(leagueId) {
         standings = standings.concat(mapped);
       }
     }
+    // if single group, keep flat standings; if multi, prefer first or all
     if (groups.length === 1) standings = groups[0].standings;
   } catch (e) {
     console.error('[table parse]', e.message);
   }
 
+  // fixtures
   let fixtures = [];
   try {
     fixtures = mapFixtures(data.fixtures?.allMatches || []);
   } catch (_) {}
 
+  // scorers
   let scorers = mapScorers(data.stats?.players || []);
   const goalsBlock = (data.stats?.players || []).find(p => p.name === 'goals' || /top scorer/i.test(p.header || ''));
   if (goalsBlock?.fetchAllUrl) {
@@ -908,6 +1539,7 @@ async function fetchLeagueDetails(leagueId) {
     if (full.length) scorers = full;
   }
 
+  // assists
   let assists = [];
   const ass = (data.stats?.players || []).find(p => p.name === 'goal_assist' || /assist/i.test(p.header || ''));
   if (ass) {
@@ -916,17 +1548,12 @@ async function fetchLeagueDetails(leagueId) {
       rank: p.rank ?? i + 1,
       name: p.name,
       teamId: p.teamId,
-      teamName: p.TeamName,
+      teamName: p.teamName,
       assists: p.value,
       photo: fotmobPhoto(p.id),
       teamLogo: p.teamId ? `https://images.fotmob.com/image_resources/logo/teamlogo/${p.teamId}_small.png` : null
     }));
   }
-
-  // ========== الجديد: أخبار + انتقالات + ملخصات ==========
-  const news = await getNews(leagueId);
-  const transfers = await getTransfers(leagueId);
-  const highlights = await getHighlights(leagueId);
 
   const meta = LEAGUES.find(l => l.id === id) || {};
   const result = {
@@ -949,9 +1576,6 @@ async function fetchLeagueDetails(leagueId) {
       scorers: scorers.length,
       fixtures: fixtures.length
     },
-    news,
-    transfers,
-    highlights,
     updatedAt: new Date().toISOString()
   };
 
@@ -959,72 +1583,189 @@ async function fetchLeagueDetails(leagueId) {
   return result;
 }
 
-async function getNews(leagueId) {
+// ========== PUSH NOTIFICATIONS ==========
+const SUBS_FILE = path.join(DATA_DIR, 'push-subs.json');
+const VAPID_FILE = path.join(DATA_DIR, 'vapid.json');
+const SENT_FILE = path.join(DATA_DIR, 'push-sent.json');
+
+let VAPID = { publicKey: process.env.VAPID_PUBLIC_KEY || null, privateKey: process.env.VAPID_PRIVATE_KEY || null, source: 'env' };
+if (!VAPID.publicKey || !VAPID.privateKey) {
   try {
-    const { data } = await get(`https://www.ekeeira.com/دوري-مصري/`, { timeout: 10000 });
-    const $ = cheerio.load(data);
-    const newsItems = [];
-    $('.news-item, .article').each((_, el) => {
-      const title = $(el).find('h2, a').first().text().trim();
-      const desc = $(el).text().trim().substring(0, 120);
-      if (title) newsItems.push({ title, description: desc });
-    });
-    return newsItems.slice(0, 8);
-  } catch (e) {
-    console.error('[News]', e.message);
-    return [];
-  }
+    const j = JSON.parse(fs.readFileSync(VAPID_FILE, 'utf8'));
+    if (j.publicKey && j.privateKey) VAPID = { publicKey: j.publicKey, privateKey: j.privateKey, source: 'file' };
+  } catch (_) {}
+}
+if (!VAPID.publicKey || !VAPID.privateKey) {
+  const gen = webpush.generateVAPIDKeys();
+  VAPID = { publicKey: gen.publicKey, privateKey: gen.privateKey, source: 'generated' };
+  try { fs.writeFileSync(VAPID_FILE, JSON.stringify({ publicKey: gen.publicKey, privateKey: gen.privateKey })); } catch (_) {}
+  console.log('\n[Push] ⚠ اتولّدت مفاتيح VAPID جديدة. عشان متضيعش بعد أي Redeploy على Railway ضيفهم في Variables:');
+  console.log('VAPID_PUBLIC_KEY=' + gen.publicKey);
+  console.log('VAPID_PRIVATE_KEY=' + gen.privateKey + '\n');
+}
+webpush.setVapidDetails(process.env.VAPID_SUBJECT || 'mailto:push@sirtv-live.example.com', VAPID.publicKey, VAPID.privateKey);
+
+/** endpoint → { subscription, teams:[{id,names[]}], matches:[key], prefs } */
+const pushSubs = new Map();
+const DEF_PREFS = { goals: 'all', remind: true, kickoff: true, final: true };
+
+function indexSub(e) {
+  e.prefs = { ...DEF_PREFS, ...(e.prefs || {}) };
+  e._tid = new Set((e.teams || []).map(t => Number(t.id)).filter(Boolean));
+  e._tn = new Set();
+  for (const t of e.teams || []) for (const n of t.names || []) { const k = normAr(n); if (k) { e._tn.add(k); e._tn.add(stripAl(k)); } }
+  e._mk = new Set((e.matches || []).map(String));
+  return e;
+}
+function loadSubs() {
+  try {
+    if (!fs.existsSync(SUBS_FILE)) return;
+    const arr = JSON.parse(fs.readFileSync(SUBS_FILE, 'utf8'));
+    if (Array.isArray(arr)) {
+      for (const e of arr) if (e && e.subscription && e.subscription.endpoint) pushSubs.set(e.subscription.endpoint, indexSub(e));
+      console.log('[Push] Loaded', pushSubs.size, 'subscriptions');
+    }
+  } catch (e) { console.error('[Push] loadSubs', e.message); }
+}
+let saveT = null;
+function saveSubs() {
+  clearTimeout(saveT);
+  saveT = setTimeout(() => {
+    try {
+      const arr = [...pushSubs.values()].map(({ _tid, _tn, _mk, ...rest }) => rest);
+      fs.writeFileSync(SUBS_FILE, JSON.stringify(arr));
+    } catch (e) { console.error('[Push] saveSubs', e.message); }
+  }, 500);
+}
+loadSubs();
+
+function cleanBody(b) {
+  const teams = (Array.isArray(b.teams) ? b.teams : []).slice(0, 40).map(t => ({
+    id: Number(t.id) || null,
+    names: (Array.isArray(t.names) ? t.names : []).slice(0, 10).map(x => String(x).slice(0, 60))
+  }));
+  const matches = (Array.isArray(b.matches) ? b.matches : []).slice(0, 200).map(x => String(x).slice(0, 300));
+  const p = b.prefs || {};
+  const prefs = {
+    goals: p.goals === 'mine' ? 'mine' : 'all',
+    remind: p.remind !== false, kickoff: p.kickoff !== false, final: p.final !== false
+  };
+  return { teams, matches, prefs };
+}
+function upsertSub(body) {
+  const { subscription } = body || {};
+  if (!subscription || !subscription.endpoint || !subscription.keys) return null;
+  const old = pushSubs.get(subscription.endpoint);
+  const e = indexSub({ subscription, ...cleanBody(body), created: (old && old.created) || Date.now(), updated: Date.now() });
+  pushSubs.set(subscription.endpoint, e);
+  saveSubs();
+  return e;
 }
 
-async function getTransfers(leagueId) {
+async function pushOne(entry, payload, ttl) {
   try {
-    const { data } = await get(`https://www.transfermarkt.com/دوري-مصري/`, { timeout: 10000 });
-    const $ = cheerio.load(data);
-    const transfers = [];
-    $('.transfer-item').each((_, el) => {
-      const player = $(el).find('.player-name').text().trim();
-      const from = $(el).find('.from').text().trim();
-      const to = $(el).find('.to').text().trim();
-      const fee = $(el).find('.fee').text().trim();
-      if (player) transfers.push({ player, from, to, fee });
-    });
-    return transfers.slice(0, 10);
+    await webpush.sendNotification(entry.subscription, JSON.stringify(payload), { TTL: ttl || 120, urgency: 'high' });
+    return { ok: true };
   } catch (e) {
-    console.error('[Transfers]', e.message);
-    return [];
+    const code = e.statusCode || 0;
+    console.error('[Push] send fail', code, (e.body || e.message || '').toString().slice(0, 120));
+    if ([401, 403, 404, 410].includes(code)) { pushSubs.delete(entry.subscription.endpoint); saveSubs(); }
+    return { ok: false, code, body: e.body || e.message };
   }
 }
+async function pushMany(list, payload, ttl) {
+  let sent = 0;
+  await pool(list, 8, async (e) => { const r = await pushOne(e, payload, ttl); if (r.ok) sent++; });
+  return sent;
+}
 
-async function getHighlights(leagueId) {
-  try {
-    const { data } = await get(`https://www.youtube.com/results?search_query=ملخص+مباراة+دوري+مصري`, { timeout: 10000 });
-    const $ = cheerio.load(data);
-    const highlights = [];
-    $('ytd-video-renderer').each((_, el) => {
-      const title = $(el).find('a#video-title').attr('title') || '';
-      const videoId = $(el).find('a#video-title').attr('href') ? $(el).find('a#video-title').attr('href').split('v=')[1] : null;
-      if (title && videoId) highlights.push({ title, url: `https://www.youtube.com/watch?v=${videoId}` });
-    });
-    return highlights.slice(0, 5);
-  } catch (e) {
-    console.error('[Highlights]', e.message);
-    return [];
+function followsMatch(e, m) {
+  if (e._mk.has(String(m.key))) return true;
+  if (m.homeId && e._tid.has(m.homeId)) return true;
+  if (m.awayId && e._tid.has(m.awayId)) return true;
+  for (const n of [m.home, m.away]) { const k = normAr(n); if (e._tn.has(k) || e._tn.has(stripAl(k))) return true; }
+  return false;
+}
+
+const sentKeys = new Map();
+try {
+  if (fs.existsSync(SENT_FILE)) for (const [k, v] of Object.entries(JSON.parse(fs.readFileSync(SENT_FILE, 'utf8')))) sentKeys.set(k, v);
+} catch (_) {}
+let sentDirty = false;
+function once(k) {
+  if (sentKeys.has(k)) return false;
+  sentKeys.set(k, Date.now()); sentDirty = true; return true;
+}
+setInterval(() => {
+  const cut = Date.now() - 2 * 86400000;
+  for (const [k, v] of sentKeys) if (v < cut) { sentKeys.delete(k); sentDirty = true; }
+  if (sentDirty) { sentDirty = false; try { fs.writeFileSync(SENT_FILE, JSON.stringify(Object.fromEntries(sentKeys))); } catch (_) {} }
+}, 60 * 1000);
+
+const snap = new Map(); // key → { score, st }
+const scoreOf = m => (m.homeScore != null && m.awayScore != null) ? [m.homeScore, m.awayScore] : null;
+function seedSnapshot(matches) {
+  for (const m of matches || []) snap.set(m.key, { score: scoreOf(m), st: m.statusType });
+}
+async function fire(type, m, extra) {
+  const hs = m.homeScore ?? 0, as = m.awayScore ?? 0;
+  let title, body, ttl = 120;
+  if (type === 'goal') { title = `⚽ جوووول! ${extra.team || ''}`.trim(); body = `${m.home} ${hs} - ${as} ${m.away}${m.status ? ' • ' + m.status : ''}`; }
+  else if (type === 'remind') { title = '⏰ المباراة بعد 15 دقيقة'; body = `${m.home} × ${m.away}${m.time ? ' — ' + m.time : ''}`; ttl = 600; }
+  else if (type === 'kickoff') { title = '🔔 بدأت المباراة'; body = `${m.home} × ${m.away}`; ttl = 300; }
+  else { title = '🏁 انتهت المباراة'; body = `${m.home} ${hs} - ${as} ${m.away}`; ttl = 3600; }
+  const payload = {
+    title, body, tag: `${type}-${m.key}${type === 'goal' ? '-' + hs + '-' + as : ''}`,
+    icon: m.homeLogo || undefined,
+    data: { type, key: m.key, link: m.link, home: m.home, away: m.away, url: '#m=' + encodeURIComponent(m.key) }
+  };
+  const targets = [...pushSubs.values()].filter(e => {
+    const mine = followsMatch(e, m);
+    if (type === 'goal') return e.prefs.goals === 'all' || mine;
+    if (!mine) return false;
+    return type === 'remind' ? e.prefs.remind : type === 'kickoff' ? e.prefs.kickoff : e.prefs.final;
+  });
+  try { io.emit('notify', { ...payload, matchKey: m.key, homeId: m.homeId, awayId: m.awayId }); } catch (_) {}
+  const n = await pushMany(targets, payload, ttl);
+  console.log(`[Push] ${type} ${m.home} x ${m.away} → ${n}/${targets.length}`);
+}
+function notifyTick(matches) {
+  const now = Date.now();
+  for (const m of matches || []) {
+    const prev = snap.get(m.key);
+    const score = scoreOf(m);
+    snap.set(m.key, { score, st: m.statusType });
+
+    if (m.statusType === 'upcoming' && m.startMs) {
+      const dt = m.startMs - now;
+      if (dt > 0 && dt <= 15 * 60000 + 30000 && once('rem:' + m.key)) fire('remind', m);
+    }
+    if (!prev) continue;
+    if (prev.st === 'upcoming' && m.statusType === 'live' && once('ko:' + m.key)) fire('kickoff', m);
+    if (prev.st !== 'finished' && m.statusType === 'finished' && once('ft:' + m.key)) fire('final', m);
+    if (score && m.statusType !== 'upcoming') {
+      const p = prev.score || [0, 0];
+      if (score[0] + score[1] > p[0] + p[1] && once(`g:${m.key}:${score[0]}-${score[1]}`)) {
+        fire('goal', m, { team: score[0] > p[0] ? m.home : m.away });
+      }
+    }
   }
 }
 
 // ========== ROUTES ==========
 app.get('/api/matches', (req, res) => res.json({ success: true, ...cache }));
 
+// قائمة الدوريات والبطولات
 app.get('/api/leagues', (req, res) => {
   res.json({
     success: true,
-    leagues: LEAGUES.map(l => ({
-      ...l,
+    leagues: LEAGUES.filter(l => !leagueBad.has(l.id)).map(l => ({
+      id: l.id, name: l.name, nameAr: l.nameAr, country: l.country, type: l.type,
       logo: `https://images.fotmob.com/image_resources/logo/leaguelogo/${l.id}.png`
     }))
   });
 });
-
+// تفاصيل دوري: ترتيب + هدافين + مباريات
 app.get('/api/league/:id', async (req, res) => {
   try {
     const data = await fetchLeagueDetails(req.params.id);
@@ -1046,6 +1787,7 @@ app.get('/api/league', async (req, res) => {
   }
 });
 
+
 app.get('/api/match/details', async (req, res) => {
   const link = req.query.link ? decodeURIComponent(req.query.link) : null;
   const id = req.query.id || null;
@@ -1064,73 +1806,106 @@ app.get('/api/match/details', async (req, res) => {
   }
 });
 
-// Push notifications
-app.get('/api/push/vapid', (req, res) => {
-  res.json({ success: true, publicKey: VAPID.publicKey });
+
+// ===== v3.9: ترتيب الفرق / متابعة الفرق / فحص الوقت =====
+const teamBrief = t => ({
+  id: t.id, name: t.name, nameAr: teamArName(t), logo: t.logo, aliases: teamAliasesAr(t),
+  rank: t.domestic ? { rank: t.domestic.rank, pts: t.domestic.pts, played: t.domestic.played, gd: t.domestic.gd, leagueId: t.domestic.leagueId, league: t.domestic.leagueNameAr } : null
 });
 
-app.post('/api/push/subscribe', async (req, res) => {
-  try {
-    const { subscription, teams, matches } = req.body || {};
-    if (!subscription || !subscription.endpoint || !subscription.keys) {
-      return res.status(400).json({ success: false, error: 'subscription required' });
-    }
-    const key = subKey(subscription);
-    pushSubs.set(key, {
-      subscription,
-      teams: Array.isArray(teams) ? teams : [],
-      matches: Array.isArray(matches) ? matches : []
-    });
-    saveSubs();
-    res.json({ success: true, subscribers: pushSubs.size });
-  } catch (e) {
-    res.status(500).json({ success: false, error: e.message });
-  }
+app.get('/api/ranks', async (req, res) => {
+  if (!teamIndex.byId.size) { try { await buildTeamIndex(true); } catch (_) {} }
+  const teams = {};
+  for (const t of teamIndex.byId.values()) if (t.domestic) teams[t.id] = teamBrief(t);
+  res.json({ success: true, count: Object.keys(teams).length, builtAt: teamIndex.builtAt, teams });
 });
+
+app.get('/api/teams/search', async (req, res) => {
+  if (!teamIndex.byId.size) { try { await buildTeamIndex(true); } catch (_) {} }
+  const q = String(req.query.q || '').trim();
+  const k = normAr(q), k2 = stripAl(k), ke = normEn(q);
+  if (k.length < 2) return res.json({ success: true, teams: [] });
+  const scored = [];
+  for (const t of teamIndex.byId.values()) {
+    const names = [normEn(t.name), normEn(t.short), ...teamAliasesAr(t).map(normAr)].filter(Boolean);
+    let sc = 0;
+    for (const n of names) {
+      for (const x of [k, k2, ke]) {
+        if (!x) continue;
+        if (n === x || stripAl(n) === x) sc = Math.max(sc, 3);
+        else if (n.startsWith(x) || stripAl(n).startsWith(x)) sc = Math.max(sc, 2);
+        else if (n.includes(x)) sc = Math.max(sc, 1);
+      }
+    }
+    if (sc) scored.push({ sc, t });
+  }
+  scored.sort((a, b) => b.sc - a.sc || (a.t.domestic ? 0 : 1) - (b.t.domestic ? 0 : 1));
+  res.json({ success: true, teams: scored.slice(0, 15).map(x => teamBrief(x.t)) });
+});
+
+app.get('/api/team/:id', async (req, res) => {
+  if (!teamIndex.byId.size) { try { await buildTeamIndex(true); } catch (_) {} }
+  const t = teamIndex.byId.get(Number(req.params.id));
+  if (!t) return res.status(404).json({ success: false, error: 'team not found' });
+  res.json({ success: true, team: teamSummary(t) });
+});
+
+// بيرجّع الوقت الخام من المصدر والوقت بعد التصحيح — عشان تتأكد من SRC_SHIFT_MIN
+app.get('/api/debug/time', (req, res) => {
+  res.json({
+    success: true, version: VERSION, tz: TZ, SRC_SHIFT_MIN, START_ADJUST_MIN,
+    nowUtc: new Date().toISOString(), nowCairo: fmtClock12(Date.now()), sample: lastRaw
+  });
+});
+
+// ===== Push =====
+app.get('/api/push/vapid', (req, res) => {
+  res.json({ success: true, publicKey: VAPID.publicKey, source: VAPID.source });
+});
+
+const subscribeHandler = (req, res) => {
+  try {
+    const e = upsertSub(req.body || {});
+    if (!e) return res.status(400).json({ success: false, error: 'subscription required' });
+    res.json({ success: true, subscribers: pushSubs.size, teams: e.teams.length, matches: e.matches.length, prefs: e.prefs });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+};
+app.post('/api/push/subscribe', subscribeHandler);
+app.post('/api/push/sync', subscribeHandler);
 
 app.post('/api/push/unsubscribe', (req, res) => {
   const { endpoint } = req.body || {};
-  if (endpoint) {
-    pushSubs.delete(endpoint);
-    saveSubs();
-  }
+  if (endpoint) { pushSubs.delete(endpoint); saveSubs(); }
   res.json({ success: true });
 });
 
 app.get('/api/push/status', (req, res) => {
   res.json({
-    success: true,
-    subscribers: pushSubs.size,
-    vapidConfigured: !!VAPID.publicKey,
-    publicKey: VAPID.publicKey
+    success: true, subscribers: pushSubs.size, vapidConfigured: !!VAPID.publicKey,
+    vapidSource: VAPID.source, vapidStable: VAPID.source !== 'generated', publicKey: VAPID.publicKey
   });
 });
 
+// إشعار تجربة فورًا
 app.post('/api/push/test', async (req, res) => {
   try {
     const { subscription } = req.body || {};
     const payload = {
-      title: '⚽ كورة لايف',
-      body: 'تم تفعيل الإشعارات بنجاح — هنبعتلك عند الجول',
-      tag: 'test-koora',
-      data: { test: true }
+      title: '⚽ كورة لايف', body: 'تم تفعيل الإشعارات بنجاح — هنبعتلك عند الجول',
+      tag: 'test-koora', data: { test: true, url: '' }
     };
     if (subscription && subscription.endpoint) {
       await webpush.sendNotification(subscription, JSON.stringify(payload), { TTL: 60, urgency: 'high' });
-      pushSubs.set(subscription.endpoint, { subscription, teams: [], matches: [] });
-      saveSubs();
+      if (!pushSubs.has(subscription.endpoint)) upsertSub({ subscription });
       return res.json({ success: true, sent: 1, mode: 'direct' });
     }
-    const sent = await sendPushToAll(payload);
+    const sent = await pushMany([...pushSubs.values()], payload, 60);
     res.json({ success: true, sent, mode: 'broadcast', subscribers: pushSubs.size });
   } catch (e) {
     console.error('[Push test]', e.statusCode, e.body || e.message);
-    res.status(500).json({
-      success: false,
-      error: e.message,
-      statusCode: e.statusCode || null,
-      body: e.body || null
-    });
+    res.status(500).json({ success: false, error: e.message, statusCode: e.statusCode || null, body: e.body || null });
   }
 });
 
@@ -1149,13 +1924,13 @@ app.get('/api/stream', async (req, res) => {
   if (!link) return res.status(400).json({ success: false, error: 'link required' });
   try {
     const result = await resolveStream(decodeURIComponent(link));
-    const host = `\( {req.protocol}:// \){req.get('host')}`;
+    const host = `${req.protocol}://${req.get('host')}`;
     const ref = encodeURIComponent(result.referer || '');
     const qualities = (result.qualities || []).map(q => ({
       label: q.label,
-      url: `\( {host}/proxy?url= \){encodeURIComponent(q.url)}&ref=${ref}`
+      url: `${host}/proxy?url=${encodeURIComponent(q.url)}&ref=${ref}`
     }));
-    const playUrl = `\( {host}/proxy?url= \){encodeURIComponent(result.streamUrl)}&ref=${ref}`;
+    const playUrl = `${host}/proxy?url=${encodeURIComponent(result.streamUrl)}&ref=${ref}`;
     res.json({
       success: true, playUrl, qualities, quality: result.quality,
       type: 'hls', proxied: true, resolvedAt: result.resolvedAt
@@ -1182,15 +1957,19 @@ app.get('/health', (req, res) => {
 
 app.get('/', (req, res) => {
   res.json({
-    name: 'Sir TV Live', version: '3.9.1', status: 'running',
-    features: ['matches', 'leagues', 'standings', 'scorers', 'fixtures', 'push-notifications', 'rich-details-fotmob', 'full-hls-proxy', 'egyptian-premier-league', 'news-transfers-highlights'],
+    name: 'Sir TV Live Server', version: '3.9', status: 'running',
+    features: ['matches', 'leagues', 'standings', 'scorers', 'fixtures', 'push-notifications', 'rich-details-fotmob', 'full-hls-proxy', 'team-follow', 'ranks', 'time-fix'],
     endpoints: {
       matches: 'GET /api/matches',
       leagues: 'GET /api/leagues',
       league: 'GET /api/league/:id',
       stream: 'GET /api/stream?link=',
       details: 'GET /api/match/details?link=&id=&home=&away=',
-      health: 'GET /health'
+      health: 'GET /health',
+      ranks: 'GET /api/ranks',
+      teamSearch: 'GET /api/teams/search?q=',
+      team: 'GET /api/team/:id',
+      debugTime: 'GET /api/debug/time'
     }
   });
 });
@@ -1202,25 +1981,26 @@ setInterval(() => {
   for (const [k, v] of detailsCache) if (now - v.ts > 10 * 60 * 1000) detailsCache.delete(k);
   for (const [k, v] of streamCache) if (now - v.ts > 5 * 60 * 1000) streamCache.delete(k);
   for (const [k, v] of leagueCache) if (now - v.ts > 30 * 60 * 1000) leagueCache.delete(k);
+  for (const [k, v] of dayCache) if (now - v.ts > 10 * 60 * 1000) dayCache.delete(k);
 }, 5 * 60 * 1000);
 
 async function boot() {
   await fetchMatches();
-  for (const m of cache.matches || []) {
-    const key = String(m.id || m.link || `\( {m.home}- \){m.away}`);
-    if (m.score) scoreSnapshot.set(key, String(m.score).replace(/\s+/g, ''));
-  }
+  seedSnapshot(cache.matches);           // نزرع الحالة الحالية من غير ما نبعت إشعارات
   io.emit('matches', cache);
+  buildTeamIndex(true).catch(e => console.error('[Index]', e.message));
   setInterval(async () => {
     const d = await fetchMatches();
     io.emit('matches', d);
-    try { detectGoalNotifications(d.matches || []); } catch (_) {}
-  }, 30000);
+    try { notifyTick(d.matches || []); } catch (e) { console.error('[notify]', e.message); }
+  }, 20000);
+  setInterval(() => buildTeamIndex().catch(() => {}), 5 * 60 * 1000);
 }
 
 boot().catch(console.error);
 
 server.listen(PORT, () => {
-  console.log(`\n🔥 Sir TV Live v3.9.1 — port ${PORT}`);
-  console.log(`   دوري مصري + أخبار + انتقالات + ملخصات فيديو\n`);
+  console.log(`\n🔥 Sir TV Live v${VERSION} — port ${PORT}`);
+  console.log(`   TZ=${TZ} SRC_SHIFT_MIN=${SRC_SHIFT_MIN} | VAPID=${VAPID.source}`);
+  console.log(`   Time fix | Ranks | Team follow | Rich details | Push\n`);
 });
