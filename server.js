@@ -48,6 +48,18 @@ const path = require('path');
 const webpush = require('web-push');
 
 const app = express();
+
+// Build absolute URLs that browsers can use from HTTPS sites behind Railway.
+// Express may see the internal HTTP connection and req.protocol can therefore
+// produce insecure http:// playlist/segment URLs unless the proxy headers are trusted.
+function publicBaseUrl(req) {
+  const host = String(req.get('host') || '').trim();
+  const forwardedProto = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim().toLowerCase();
+  const isRailwayHost = /(^|\.)up\.railway\.app$/i.test(host);
+  const proto = isRailwayHost || forwardedProto === 'https' || req.secure ? 'https' : 'http';
+  return `${proto}://${host}`;
+}
+
 const server = http.createServer(app);
 const PORT = process.env.PORT || 3000;
 const SOURCE = 'https://sir-tv.vip/';
@@ -1372,7 +1384,7 @@ async function proxyHls(req, res, targetUrl, referer) {
     if (isPlaylist) {
       let body = Buffer.from(response.data).toString('utf8');
       const base = new URL(targetUrl);
-      const host = `${req.protocol}://${req.get('host')}`;
+      const host = publicBaseUrl(req);
       const proxyBase = `${host}/proxy?url=`;
       const refQ = (mk ? `&k=${encodeURIComponent(String(req.query.k))}` : '') + (referer ? `&ref=${encodeURIComponent(referer)}` : '');
       body = body.replace(/(https?:\/\/[^\s\n\r"']+)/g, m => proxyBase + encodeURIComponent(m) + refQ);
@@ -2581,7 +2593,7 @@ app.get('/api/stream', async (req, res) => {
   const mlink = decodeURIComponent(link);
   const man = manualFor(req.query.key ? String(req.query.key) : null, mlink);
   if (man && man.sources && man.sources.length) {
-    const host0 = `${req.protocol}://${req.get('host')}`, sk = safeKey(man.key);
+    const host0 = publicBaseUrl(req), sk = safeKey(man.key);
     const qs = man.sources.map(s => ({ label: s.label || 'HD', url: man.mode === 'direct' ? s.url : `${host0}/proxy?url=${encodeURIComponent(s.url)}&k=${encodeURIComponent(sk)}` }));
     return res.json({ success: true, playUrl: qs[0].url, qualities: qs, quality: qs[0].label, type: 'hls', proxied: man.mode !== 'direct', manual: true, embedUrl: man.embed || null, resolvedAt: new Date().toISOString() });
   }
@@ -2590,7 +2602,7 @@ app.get('/api/stream', async (req, res) => {
   const fallbackEmbed = () => ctx.embed || null;
   try {
     const result = await resolveStream(mlink, ctx);
-    const host = `${req.protocol}://${req.get('host')}`;
+    const host = publicBaseUrl(req);
     const ref = encodeURIComponent(result.referer || '');
     const qualities = (result.qualities || []).map(q => ({
       label: q.label,
