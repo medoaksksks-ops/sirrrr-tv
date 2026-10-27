@@ -1325,13 +1325,34 @@ function buildResult(streams, referer) {
 async function proxyHls(req, res, targetUrl, referer) {
   try {
     const mk = req.query.k ? manualStreams.get(String(req.query.k)) : null;
+    const targetHost = new URL(targetUrl).hostname.toLowerCase();
+
+    // استخدم هيدرز مصدر Shootsimo نفسها لكل من playlist وملفات TS.
+    // مهم: الطلبات الفرعية للـ HLS تمر من /proxy أيضاً، لذلك يجب أن تستخدم
+    // نفس Origin / Referer / Cookie / User-Agent، وليس هيدرز SirTV الافتراضية.
+    const isShootsimo = targetHost === 'shootsimo.net' ||
+      targetHost.endsWith('.shootsimo.net');
+    const requestHeaders = mk
+      ? streamHeaders(mk)
+      : isShootsimo
+        ? streamHeaders({
+            referer: process.env.STREAM_REFERER || 'https://2.shootsimo.net/',
+            origin: process.env.STREAM_ORIGIN || 'https://2.shootsimo.net',
+            ua: process.env.STREAM_UA,
+            accept: process.env.STREAM_ACCEPT,
+            cookie: process.env.STREAM_COOKIE
+          })
+        : {
+            'User-Agent': UA,
+            Accept: '*/*',
+            Origin: 'https://912acsss8af382.sirtv.top',
+            Referer: referer || 'https://912acsss8af382.sirtv.top/',
+            'Accept-Encoding': 'identity',
+            Connection: 'keep-alive'
+          };
+
     const response = await axios.get(targetUrl, {
-      headers: mk ? streamHeaders(mk) : {
-        'User-Agent': UA,
-        Accept: '*/*',
-        Origin: 'https://912acsss8af382.sirtv.top',
-        Referer: referer || 'https://912acsss8af382.sirtv.top/'
-      },
+      headers: requestHeaders,
       responseType: 'arraybuffer',
       timeout: 22000,
       maxRedirects: 5,
@@ -2591,7 +2612,9 @@ app.get('/api/stream', async (req, res) => {
 app.get('/proxy', async (req, res) => {
   const target = req.query.url;
   if (!target) return res.status(400).send('url required');
-  await proxyHls(req, res, decodeURIComponent(target), req.query.ref ? decodeURIComponent(req.query.ref) : null);
+  // Express decodes query parameters automatically; don't decode target again,
+  // otherwise escaped characters inside the source URL can be corrupted.
+  await proxyHls(req, res, target, req.query.ref || null);
 });
 
 app.get('/health', (req, res) => {
