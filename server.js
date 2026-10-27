@@ -1,6 +1,10 @@
 /**
- * Sir TV Live Server v4.3
+ * Sir TV Live Server v5.0
  * ------------------------------------------------------------
+ * v5.0:
+ *  - نظام بث يدوي: لوحة تحكم (admin) بتحط رابط m3u8 لكل ماتش، بيتحفظ في Firebase
+ *    والسيرفر بيشغّله عبر بروكسي بنفس Referer/Origin/User-Agent. متغيرات: ADMIN_PASSWORD, FIREBASE_DB_URL, FIREBASE_SECRET
+ *    مسارات: /api/admin/{login,matches,stream,test} — و /api/stream بيدّي الأولوية للرابط اليدوي
  * v4.3:
  *  - GET /api/article?url= : قارئ مقالات جوه الموقع (بيفك روابط أخبار جوجل ويطلّع النص والصورة)
  * v4.2:
@@ -85,7 +89,7 @@ const io = new Server(server, { cors: { origin: true }, pingInterval: 20000, pin
 let cache = {
   matches: [], live: [], finished: [], upcoming: [],
   counts: { total: 0, live: 0, finished: 0, upcoming: 0 },
-  lastUpdate: null, error: null, version: '4.3'
+  lastUpdate: null, error: null, version: '5.0'
 };
 
 const detailsCache = new Map();
@@ -108,7 +112,7 @@ function to12Hour(timeStr) {
 }
 
 // ========== TIME (Africa/Cairo) ==========
-const VERSION = '4.3';
+const VERSION = '5.0';
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch (_) {}
 const envNum = (k, d) => { const v = process.env[k]; if (v === undefined || v === '') return d; const n = Number(v); return Number.isFinite(n) ? n : d; };
@@ -958,6 +962,7 @@ function attachInfo(matches) {
     m.homeId = hid || null; m.awayId = aid || null;
     m.homeRank = rankOf(hid); m.awayRank = rankOf(aid);
     m.league = r ? leagueMeta(r.leagueId, r.leagueName) : null;
+    if (typeof manualFor === 'function' && manualFor(m.key, m.link, m.home, m.away)) { m.hasStream = true; m.manual = true; }
   }
 }
 function teamArName(t) { return trAr(t.short || t.name); }
@@ -1314,8 +1319,9 @@ function buildResult(streams, referer) {
 
 async function proxyHls(req, res, targetUrl, referer) {
   try {
+    const mk = req.query.k ? manualStreams.get(String(req.query.k)) : null;
     const response = await axios.get(targetUrl, {
-      headers: {
+      headers: mk ? streamHeaders(mk) : {
         'User-Agent': UA,
         Accept: '*/*',
         Origin: 'https://912acsss8af382.sirtv.top',
@@ -1342,11 +1348,12 @@ async function proxyHls(req, res, targetUrl, referer) {
       const base = new URL(targetUrl);
       const host = `${req.protocol}://${req.get('host')}`;
       const proxyBase = `${host}/proxy?url=`;
-      const refQ = referer ? `&ref=${encodeURIComponent(referer)}` : '';
+      const refQ = (mk ? `&k=${encodeURIComponent(String(req.query.k))}` : '') + (referer ? `&ref=${encodeURIComponent(referer)}` : '');
       body = body.replace(/(https?:\/\/[^\s\n\r"']+)/g, m => proxyBase + encodeURIComponent(m) + refQ);
       body = body.replace(/^([a-zA-Z0-9_\-\.\/]+\.(ts|m4s|key|m3u8)[^\s]*)$/gm, m => {
         try { return proxyBase + encodeURIComponent(new URL(m, base).href) + refQ; } catch { return m; }
       });
+      body = body.replace(/URI="([^"]+)"/g, (m0, u) => { if (u.startsWith(proxyBase)) return m0; try { return 'URI="' + proxyBase + encodeURIComponent(new URL(u, base).href) + refQ + '"'; } catch { return m0; } });
       res.set('Content-Type', 'application/vnd.apple.mpegurl');
       return res.send(body);
     }
@@ -2131,6 +2138,158 @@ async function getPlayer(id) {
   return data;
 }
 
+// ========== v5.0: روابط البث اليدوية (لوحة تحكم + Firebase) ==========
+const crypto = require('crypto');
+const FIREBASE_URL = String(process.env.FIREBASE_DB_URL || 'https://english-73376-default-rtdb.firebaseio.com').replace(/\/+$/, '');
+const FIREBASE_SECRET = process.env.FIREBASE_SECRET || '';           // اختياري: Database secret لو الـ rules مقفولة
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '';
+const STREAMS_FILE = path.join(DATA_DIR, 'manual-streams.json');
+const fbAuth = FIREBASE_SECRET ? `?auth=${encodeURIComponent(FIREBASE_SECRET)}` : '';
+const fbUrl = p => `${FIREBASE_URL}/${p}.json${fbAuth}`;
+
+const manualStreams = new Map();   // safeKey → entry
+const manualByTeams = new Map();   // "home|away" → safeKey
+let fbState = { ok: null, err: null, ts: 0 };
+const safeKey = k => Buffer.from(String(k || ''), 'utf8').toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '').slice(0, 120);
+const teamsKey = (h, a) => `${stripAl(normAr(h))}|${stripAl(normAr(a))}`;
+
+function cleanEntry(b, old) {
+  const urlOk = u => /^https?:\/\/[^\s]+$/i.test(u || '') && !privateHost(new URL(u).hostname);
+  const sources = (Array.isArray(b.sources) ? b.sources : []).slice(0, 8)
+    .map(s => ({ label: String((s && s.label) || '').slice(0, 20), url: String((s && s.url) || '').trim() }))
+    .filter(s => { try { return urlOk(s.url); } catch (_) { return false; } });
+  const embed = String(b.embed || '').trim();
+  if (!sources.length && !/^https?:\/\//i.test(embed)) return null;
+  const str = (x, n) => String(x || '').trim().slice(0, n);
+  return {
+    key: str(b.key, 300), home: str(b.home, 80), away: str(b.away, 80),
+    sources, embed: /^https?:\/\//i.test(embed) ? embed.slice(0, 600) : '',
+    referer: str(b.referer, 400), origin: str(b.origin, 200), ua: str(b.ua, 400),
+    mode: b.mode === 'direct' ? 'direct' : 'proxy', note: str(b.note, 200),
+    created: (old && old.created) || Date.now(), updated: Date.now()
+  };
+}
+function indexManual() {
+  manualByTeams.clear();
+  for (const [sk, e] of manualStreams) if (e.home && e.away) manualByTeams.set(teamsKey(e.home, e.away), sk);
+}
+function saveManualLocal() { try { fs.writeFileSync(STREAMS_FILE, JSON.stringify([...manualStreams.values()])); } catch (_) {} }
+try {
+  const arr = JSON.parse(fs.readFileSync(STREAMS_FILE, 'utf8'));
+  for (const e of arr) if (e && e.key) manualStreams.set(safeKey(e.key), e);
+  indexManual();
+} catch (_) {}
+
+async function loadManualFromFirebase() {
+  try {
+    const r = await axios.get(fbUrl('streams'), { timeout: 12000, validateStatus: s => s < 500 });
+    if (r.status >= 400) throw new Error('HTTP ' + r.status + (r.status === 401 ? ' (الـ rules مقفولة — ضيف FIREBASE_SECRET)' : ''));
+    const data = r.data && typeof r.data === 'object' ? r.data : {};
+    manualStreams.clear();
+    for (const [sk, e] of Object.entries(data)) if (e && e.key) manualStreams.set(sk, e);
+    indexManual(); saveManualLocal();
+    fbState = { ok: true, err: null, ts: Date.now() };
+  } catch (e) { fbState = { ok: false, err: e.message, ts: Date.now() }; console.error('[Firebase load]', e.message); }
+}
+async function pushManualToFirebase(sk, entry) {
+  const r = entry
+    ? await axios.put(fbUrl('streams/' + sk), entry, { timeout: 12000, validateStatus: s => s < 500 })
+    : await axios.delete(fbUrl('streams/' + sk), { timeout: 12000, validateStatus: s => s < 500 });
+  if (r.status >= 400) throw new Error('Firebase HTTP ' + r.status + (r.status === 401 || r.status === 403 ? ' — الـ rules مقفولة، ضيف FIREBASE_SECRET في Railway أو افتح الكتابة' : ''));
+}
+function manualFor(key, link, home, away) {
+  if (key && manualStreams.has(safeKey(key))) return manualStreams.get(safeKey(key));
+  let m = null;
+  if (link) m = cache.matches.find(x => x.link === link);
+  else if (key) m = cache.matches.find(x => String(x.key) === String(key));
+  if (m) {
+    const e = manualStreams.get(safeKey(m.key)) || manualStreams.get(manualByTeams.get(teamsKey(m.home, m.away)));
+    if (e) return e;
+  }
+  if (home && away) { const sk = manualByTeams.get(teamsKey(home, away)); if (sk) return manualStreams.get(sk); }
+  return null;
+}
+const expiryOf = u => { try { const e = Number(new URL(u).searchParams.get('expires')); return e > 1e9 ? e * 1000 : null; } catch (_) { return null; } };
+
+function adminAuth(req, res, next) {
+  if (!ADMIN_PASSWORD) return res.status(503).json({ success: false, error: 'ADMIN_PASSWORD مش متحدد في متغيرات Railway' });
+  const ip = req.ip || '';
+  const f = adminFails.get(ip);
+  if (f && f.n >= 10 && Date.now() - f.ts < 10 * 60 * 1000) return res.status(429).json({ success: false, error: 'محاولات كتير — استنى شوية' });
+  const a = crypto.createHash('sha256').update(String(req.headers['x-admin-key'] || '')).digest();
+  const b = crypto.createHash('sha256').update(ADMIN_PASSWORD).digest();
+  if (!crypto.timingSafeEqual(a, b)) {
+    adminFails.set(ip, { n: ((f && Date.now() - f.ts < 10 * 60 * 1000) ? f.n : 0) + 1, ts: Date.now() });
+    return res.status(401).json({ success: false, error: 'كلمة السر غلط' });
+  }
+  adminFails.delete(ip);
+  next();
+}
+const adminFails = new Map();
+const pubEntry = (sk, e) => ({ id: sk, ...e, sources: (e.sources || []).map(s => ({ ...s, expiresAt: expiryOf(s.url) })) });
+
+app.post('/api/admin/login', adminAuth, (req, res) => res.json({ success: true, firebase: fbState, firebaseUrl: FIREBASE_URL }));
+app.get('/api/admin/matches', adminAuth, (req, res) => {
+  const list = (cache.matches || []).map(m => {
+    const e = manualFor(m.key, m.link, m.home, m.away);
+    return { key: m.key, home: m.home, away: m.away, homeLogo: m.homeLogo, awayLogo: m.awayLogo, time: m.time, start: m.start, status: m.status, statusType: m.statusType, league: m.league && m.league.nameAr, hasSiteStream: !!m.hasStream, manual: e ? pubEntry(safeKey(e.key), e) : null };
+  });
+  const keys = new Set(list.filter(x => x.manual).map(x => x.manual.id));
+  const orphans = [...manualStreams.entries()].filter(([sk]) => !keys.has(sk)).map(([sk, e]) => pubEntry(sk, e));
+  res.json({ success: true, matches: list, orphans, firebase: fbState });
+});
+app.put('/api/admin/stream', adminAuth, async (req, res) => {
+  const old = manualStreams.get(safeKey(req.body && req.body.key));
+  const e = cleanEntry(req.body || {}, old);
+  if (!e || !e.key) return res.status(400).json({ success: false, error: 'محتاج key + رابط بث (أو iframe) صالح' });
+  const sk = safeKey(e.key);
+  manualStreams.set(sk, e); indexManual(); saveManualLocal();
+  streamCache.clear();
+  try { await pushManualToFirebase(sk, e); res.json({ success: true, entry: pubEntry(sk, e), saved: 'firebase' }); }
+  catch (err) { res.json({ success: true, entry: pubEntry(sk, e), saved: 'local', warning: err.message }); }
+});
+app.delete('/api/admin/stream', adminAuth, async (req, res) => {
+  const sk = String(req.query.id || safeKey(req.query.key));
+  manualStreams.delete(sk); indexManual(); saveManualLocal(); streamCache.clear();
+  try { await pushManualToFirebase(sk, null); res.json({ success: true }); }
+  catch (err) { res.json({ success: true, warning: err.message }); }
+});
+app.post('/api/admin/test', adminAuth, async (req, res) => {
+  const b = req.body || {};
+  const url = String(b.url || '');
+  try {
+    if (!/^https?:\/\//i.test(url) || privateHost(new URL(url).hostname)) throw new Error('رابط غير صالح');
+    const hdr = streamHeaders({ referer: b.referer, origin: b.origin, ua: b.ua });
+    const r = await axios.get(url, { headers: hdr, timeout: 15000, responseType: 'text', validateStatus: () => true, maxContentLength: 2e6 });
+    const body = String(r.data || '');
+    const isM3u8 = body.trim().startsWith('#EXTM3U');
+    let seg = null;
+    if (isM3u8) {
+      const line = body.split(/\r?\n/).find(l => l && !l.startsWith('#'));
+      if (line) {
+        try {
+          const sr = await axios.get(new URL(line, url).href, { headers: hdr, timeout: 15000, responseType: 'arraybuffer', validateStatus: () => true, maxContentLength: 3e6 });
+          seg = { status: sr.status, bytes: (sr.data && sr.data.byteLength) || 0 };
+        } catch (e) { seg = { error: e.message }; }
+      }
+    }
+    res.json({ success: true, status: r.status, isM3u8, master: /#EXT-X-STREAM-INF/.test(body), segment: seg, expiresAt: expiryOf(url), snippet: body.slice(0, 300) });
+  } catch (e) { res.json({ success: false, error: e.message }); }
+});
+
+// هيدرز الطلب للمصدر (نفس اللي المتصفح بيبعته)
+function streamHeaders(e) {
+  const ref = e && e.referer;
+  let origin = e && e.origin;
+  if (!origin && ref) { try { origin = new URL(ref).origin; } catch (_) {} }
+  const h = { 'User-Agent': (e && e.ua) || UA, Accept: '*/*', 'Accept-Language': 'ar-EG,ar;q=0.9,en;q=0.8' };
+  if (origin) h.Origin = origin;
+  if (ref) h.Referer = ref; else if (origin) h.Referer = origin + '/';
+  return h;
+}
+setInterval(loadManualFromFirebase, 30 * 1000);
+loadManualFromFirebase();
+
 // ========== ROUTES ==========
 app.get('/api/matches', (req, res) => res.json({ success: true, ...cache }));
 
@@ -2374,10 +2533,17 @@ app.post('/api/refresh', async (req, res) => {
 });
 
 app.get('/api/stream', async (req, res) => {
-  const link = req.query.link;
-  if (!link) return res.status(400).json({ success: false, error: 'link required' });
+  const link = req.query.link || (req.query.key ? 'key:' + req.query.key : '');
+  if (!link) return res.status(400).json({ success: false, error: 'link or key required' });
   const ctx = {};
   const mlink = decodeURIComponent(link);
+  const man = manualFor(req.query.key ? String(req.query.key) : null, mlink);
+  if (man && man.sources && man.sources.length) {
+    const host0 = `${req.protocol}://${req.get('host')}`, sk = safeKey(man.key);
+    const qs = man.sources.map(s => ({ label: s.label || 'HD', url: man.mode === 'direct' ? s.url : `${host0}/proxy?url=${encodeURIComponent(s.url)}&k=${encodeURIComponent(sk)}` }));
+    return res.json({ success: true, playUrl: qs[0].url, qualities: qs, quality: qs[0].label, type: 'hls', proxied: man.mode !== 'direct', manual: true, embedUrl: man.embed || null, resolvedAt: new Date().toISOString() });
+  }
+  if (man && man.embed) return res.json({ success: true, type: 'iframe', embedUrl: man.embed, manual: true });
   const idm = mlink.match(/[?&]m=(\d+)/);
   const fallbackEmbed = () => ctx.embed || null;
   try {
@@ -2409,7 +2575,7 @@ app.get('/proxy', async (req, res) => {
 
 app.get('/health', (req, res) => {
   res.json({
-    status: 'ok', version: '4.3', uptime: process.uptime(),
+    status: 'ok', version: '5.0', uptime: process.uptime(),
     lastUpdate: cache.lastUpdate, counts: cache.counts,
     caches: { details: detailsCache.size, streams: streamCache.size }
   });
@@ -2417,7 +2583,7 @@ app.get('/health', (req, res) => {
 
 app.get('/', (req, res) => {
   res.json({
-    name: 'Sir TV Live Server', version: '4.3', status: 'running',
+    name: 'Sir TV Live Server', version: '5.0', status: 'running',
     features: ['news', 'highlights', 'match-extras', 'player', 'league-follow', 'matches', 'leagues', 'standings', 'scorers', 'fixtures', 'push-notifications', 'rich-details-fotmob', 'full-hls-proxy', 'team-follow', 'ranks', 'time-fix'],
     endpoints: {
       matches: 'GET /api/matches',
