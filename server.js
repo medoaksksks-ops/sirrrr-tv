@@ -1,6 +1,12 @@
 /**
- * Sir TV Live Server v4.1
+ * Sir TV Live Server v4.3
  * ------------------------------------------------------------
+ * v4.3:
+ *  - GET /api/article?url= : قارئ مقالات جوه الموقع (بيفك روابط أخبار جوجل ويطلّع النص والصورة)
+ * v4.2:
+ *  - استخراج رابط البث أقوى: بيدوّر على playerv5.php?match=&key= (sirtv.top) حتى لو جوه JS/متشفّر (escaped / base64)
+ *  - GET /api/debug/stream?link= : بيوريك السيرفر شاف إيه في كل خطوة (للتشخيص)
+ *  - GET /embed?url= : بروكسي لصفحة المشغّل بـ Referer سير تي في (احتياطي للـ iframe)
  * v4.1:
  *  - البث: لو السيرفر مقدرش يطلع رابط HLS، /api/stream بيرجّع رابط الـ iframe (مشغّل المصدر)
  *    عشان الصفحة تشغّله بدل ما المباراة متشتغلش خالص (type:'iframe' + embedUrl)
@@ -79,7 +85,7 @@ const io = new Server(server, { cors: { origin: true }, pingInterval: 20000, pin
 let cache = {
   matches: [], live: [], finished: [], upcoming: [],
   counts: { total: 0, live: 0, finished: 0, upcoming: 0 },
-  lastUpdate: null, error: null, version: '4.1'
+  lastUpdate: null, error: null, version: '4.3'
 };
 
 const detailsCache = new Map();
@@ -102,7 +108,7 @@ function to12Hour(timeStr) {
 }
 
 // ========== TIME (Africa/Cairo) ==========
-const VERSION = '4.1';
+const VERSION = '4.3';
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch (_) {}
 const envNum = (k, d) => { const v = process.env[k]; if (v === undefined || v === '') return d; const n = Number(v); return Number.isFinite(n) ? n : d; };
@@ -1227,9 +1233,8 @@ async function resolveStream(matchLink, ctx = {}) {
   if (!playerUrl) {
     const mid = matchLink.match(/[?&]m=(\d+)/);
     if (mid) playerUrl = `https://n1.sirftv.com/hard/player.html?match=${mid[1]}`;
-  }
+  } else ctx.embed = playerUrl;
   if (!playerUrl) throw new Error('Player page not found');
-  ctx.embed = playerUrl;
 
   const page2 = await get(playerUrl, { headers: { ...headers, Referer: matchLink } }, 1);
   let streams = extractStreams(page2.data);
@@ -1255,11 +1260,24 @@ async function resolveStream(matchLink, ctx = {}) {
   return result;
 }
 
+// يفك الـ escape والـ base64 عشان الروابط المخبية جوه JS تتلاقي
+function normHtml(html) {
+  let h = String(html || '');
+  h = h.replace(/\\u002F/gi, '/').replace(/\\\//g, '/').replace(/&amp;/g, '&');
+  const extra = [];
+  const re = /atob\(\s*['"]([A-Za-z0-9+\/=]{16,})['"]\s*\)/g;
+  let m;
+  while ((m = re.exec(h))) { try { extra.push(Buffer.from(m[1], 'base64').toString('utf8')); } catch (_) {} }
+  return extra.length ? h + '\n' + extra.join('\n') : h;
+}
+const PLAYER_RX = /https?:\/\/[^"'\s<>\\]*(?:sirtv\.top|sirftv\.com)[^"'\s<>\\]*player[^"'\s<>\\]*/i;
 function extractPlayerUrl(html, base) {
-  const $ = cheerio.load(html);
-  const iframe = $('iframe#player, iframe[src*="sirftv"], iframe[src*="playerv"], iframe[src*="player"], iframe').first().attr('src');
-  if (iframe) return iframe.startsWith('http') ? iframe : new URL(iframe, base).href;
-  const m = html.match(/https?:\/\/[^"'\s]+sirftv\.com[^"'\s]*/i);
+  const n = normHtml(html);
+  const $ = cheerio.load(n);
+  const iframe = $('iframe#player, iframe[src*="sirtv"], iframe[src*="sirftv"], iframe[src*="playerv"], iframe[src*="player"], iframe').first().attr('src')
+    || $('iframe[data-src]').first().attr('data-src');
+  if (iframe && !/^about:|^javascript:/i.test(iframe)) return iframe.startsWith('http') ? iframe : new URL(iframe, base).href;
+  const m = n.match(PLAYER_RX) || n.match(/https?:\/\/[^"'\s<>]+player\w*\.php\?[^"'\s<>]+/i);
   return m ? m[0] : null;
 }
 
@@ -1272,6 +1290,7 @@ function extractFinalPlayer(html, base) {
 }
 
 function extractStreams(html) {
+  html = normHtml(html);
   const set = new Set();
   const patterns = [
     /https?:\/\/[a-z0-9.-]+\.live--koora\.com\/[^\s"'<>]+/gi,
@@ -1963,6 +1982,79 @@ function buildSummary(d, home, away) {
   return lines.length ? lines : null;
 }
 
+
+// ---- v4.3: قارئ المقالات ----
+const articleCache = new Map();
+const privateHost = h => /^(localhost|0\.0\.0\.0|127\.|10\.|192\.168\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.|\[?::1)/i.test(h) || !/\./.test(h);
+async function resolveGoogleNews(url) {
+  const m = url.match(/news\.google\.com\/(?:rss\/)?articles\/([^?/#]+)/i);
+  if (!m) return url;
+  const id = m[1];
+  try { // الصيغة القديمة: base64 فيه الرابط
+    const raw = Buffer.from(id.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('latin1');
+    const u = raw.match(/https?:\/\/[\x21-\x7e]+/);
+    if (u && !/news\.google/.test(u[0])) return u[0];
+  } catch (_) {}
+  try {
+    const page = await axios.get(`https://news.google.com/rss/articles/${id}`, { headers: { 'User-Agent': UA, Cookie: 'CONSENT=YES+1' }, timeout: 12000, responseType: 'text', validateStatus: s => s < 500 });
+    const html = String(page.data);
+    const sg = (html.match(/data-n-a-sg="([^"]+)"/) || [])[1], ts = (html.match(/data-n-a-ts="([^"]+)"/) || [])[1];
+    if (!sg || !ts) return url;
+    const inner = `["garturlreq",[["X","X",["X","X"],null,null,1,1,"US:en",null,1,null,null,null,null,null,0,1],"X","X",1,[1,1,1],1,1,null,0,0,null,0],"${id}",${ts},"${sg}"]`;
+    const body = 'f.req=' + encodeURIComponent(JSON.stringify([[['Fbv4je', inner, null, 'generic']]]));
+    const r = await axios.post('https://news.google.com/_/DotsSplashUi/data/batchexecute', body, { headers: { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8', 'User-Agent': UA }, timeout: 12000, responseType: 'text' });
+    const t = String(r.data).split('\n\n')[1];
+    const arr = JSON.parse(JSON.parse(t)[0][2]);
+    if (arr && /^https?:/.test(arr[1])) return arr[1];
+  } catch (e) { console.error('[gnews resolve]', e.message); }
+  return url;
+}
+function metaOf(html, names) {
+  for (const n of names) {
+    const m = html.match(new RegExp('<meta[^>]+(?:property|name)=["\']' + n + '["\'][^>]*content=["\']([^"\']*)["\']', 'i')) || html.match(new RegExp('<meta[^>]+content=["\']([^"\']*)["\'][^>]*(?:property|name)=["\']' + n + '["\']', 'i'));
+    if (m && m[1]) return xmlUnesc(m[1]).trim();
+  }
+  return '';
+}
+function extractArticle(html, url) {
+  const title = metaOf(html, ['og:title', 'twitter:title']) || stripHtml((html.match(/<title[^>]*>([\s\S]*?)<\/title>/i) || [])[1] || '');
+  const image = metaOf(html, ['og:image', 'twitter:image']);
+  const site = metaOf(html, ['og:site_name']);
+  const ts = Date.parse(metaOf(html, ['article:published_time', 'og:updated_time', 'pubdate']) || '') || null;
+  let body = html.replace(/<(script|style|noscript|svg|form|nav|footer|aside|header)[\s\S]*?<\/\1>/gi, ' ');
+  const art = body.match(/<article[\s\S]*?<\/article>/i);
+  if (art) body = art[0];
+  const paras = [], seen = new Set();
+  const re = /<(p|h2|h3)[^>]*>([\s\S]*?)<\/\1>/gi;
+  let m;
+  while ((m = re.exec(body)) && paras.length < 60) {
+    const x = stripHtml(xmlUnesc(m[2])).replace(/\s+/g, ' ').trim();
+    const isH = m[1] !== 'p';
+    if (isH ? (x.length < 4 || x.length > 120) : x.length < 45) continue;
+    if (/^(اقرأ أيضا|اقرأ ايضا|شاهد أيضا|مواضيع ذات صلة|حقوق النشر|جميع الحقوق|تابعنا|اشترك|Copyright|Read more|Advertisement)/i.test(x)) continue;
+    const k = x.slice(0, 60);
+    if (seen.has(k)) continue;
+    seen.add(k);
+    paras.push({ t: isH ? 'h' : 'p', x: x.slice(0, 1200) });
+  }
+  while (paras.length && paras[paras.length - 1].t === 'h') paras.pop();
+  const good = paras.filter(p => p.t === 'p').length >= 2;
+  return { title: stripHtml(title), image: image && /^https?:/i.test(image) ? image : null, site, ts, paras: good ? paras : [] };
+}
+async function getArticle(url) {
+  const hit = articleCache.get(url);
+  if (hit && Date.now() - hit.ts < 30 * 60 * 1000) return hit.data;
+  let real = await resolveGoogleNews(url);
+  const host = new URL(real).hostname;
+  if (privateHost(host)) throw new Error('bad host');
+  const r = await axios.get(real, { headers: { 'User-Agent': UA, 'Accept-Language': 'ar,en;q=0.8', Accept: 'text/html,*/*' }, timeout: 14000, maxContentLength: 3e6, responseType: 'text', maxRedirects: 5, validateStatus: s => s < 500 });
+  if (r.status >= 400) throw new Error('HTTP ' + r.status);
+  const a = extractArticle(String(r.data), real);
+  a.url = real; a.host = host.replace(/^www\./, '');
+  articleCache.set(url, { ts: Date.now(), data: a });
+  return a;
+}
+
 const extrasCache = new Map();
 async function getExtras({ link, id, home, away, hAr, aAr }) {
   const ck = `${link || ''}|${id || ''}|${home || ''}|${away || ''}|${hAr || ''}|${aAr || ''}`;
@@ -2149,6 +2241,12 @@ app.get('/api/news', async (req, res) => {
     res.json({ success: true, count: items.length, items: items.slice(0, limit), updatedAt: new Date().toISOString() });
   } catch (e) { res.status(500).json({ success: false, error: e.message }); }
 });
+app.get('/api/article', async (req, res) => {
+  const url = String(req.query.url || '');
+  if (!/^https?:\/\//i.test(url) || url.length > 1500) return res.status(400).json({ success: false, error: 'bad url' });
+  try { res.json({ success: true, article: await getArticle(url) }); }
+  catch (e) { res.status(502).json({ success: false, error: e.message }); }
+});
 app.get('/api/news/status', (req, res) => {
   res.json({ success: true, feeds: NEWS_FEEDS.map(f => ({ id: f.id, url: f.url, ...(feedStatus.get(f.id) || { ok: null }) })), highlightsChannels: HL_CHANNELS });
 });
@@ -2174,6 +2272,37 @@ app.get('/api/player/:id', async (req, res) => {
     if (!p) return res.status(404).json({ success: false, error: 'not found' });
     res.json({ success: true, player: p });
   } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+app.get('/api/debug/stream', async (req, res) => {
+  const link = req.query.link ? decodeURIComponent(req.query.link) : null;
+  if (!link) return res.status(400).json({ error: 'link required' });
+  const out = { link, steps: [] };
+  const headers = { 'User-Agent': UA, 'Accept-Language': 'ar,en;q=0.9', Referer: 'https://sir-tv.vip/' };
+  try {
+    const p1 = await httpClient.get(link, { headers });
+    const n1 = normHtml(p1.data);
+    const player = extractPlayerUrl(p1.data, link);
+    out.steps.push({ step: 'match page', status: p1.status, length: String(p1.data).length, iframes: (n1.match(/<iframe[^>]*>/gi) || []).slice(0, 5), playerUrl: player, snippet: String(p1.data).slice(0, 600) });
+    if (player) {
+      const p2 = await httpClient.get(player, { headers: { ...headers, Referer: link } });
+      const streams = extractStreams(p2.data);
+      out.steps.push({ step: 'player page', url: player, status: p2.status, length: String(p2.data).length, streams, finalPlayer: extractFinalPlayer(p2.data, player), snippet: String(p2.data).slice(0, 1500) });
+    }
+  } catch (e) { out.error = e.message; }
+  res.json(out);
+});
+
+app.get('/embed', async (req, res) => {
+  const url = String(req.query.url || '');
+  if (!/^https?:\/\/[^/]*(sirtv\.top|sirftv\.com|sir-tv\.vip)\//i.test(url)) return res.status(400).send('bad url');
+  try {
+    const r = await httpClient.get(url, { headers: { 'User-Agent': UA, Referer: 'https://sir-tv.vip/' }, responseType: 'text', transformResponse: x => x });
+    const origin = new URL(url).origin;
+    let html = String(r.data).replace(/<head[^>]*>/i, m => `${m}<base href="${origin}/">`);
+    res.set('Content-Type', 'text/html; charset=utf-8');
+    res.send(html);
+  } catch (e) { res.status(502).send('embed failed: ' + e.message); }
 });
 
 app.get('/api/debug/time', (req, res) => {
@@ -2250,7 +2379,7 @@ app.get('/api/stream', async (req, res) => {
   const ctx = {};
   const mlink = decodeURIComponent(link);
   const idm = mlink.match(/[?&]m=(\d+)/);
-  const fallbackEmbed = () => ctx.embed || (idm ? `https://n1.sirftv.com/hard/player.html?match=${idm[1]}` : null);
+  const fallbackEmbed = () => ctx.embed || null;
   try {
     const result = await resolveStream(mlink, ctx);
     const host = `${req.protocol}://${req.get('host')}`;
@@ -2280,7 +2409,7 @@ app.get('/proxy', async (req, res) => {
 
 app.get('/health', (req, res) => {
   res.json({
-    status: 'ok', version: '4.1', uptime: process.uptime(),
+    status: 'ok', version: '4.3', uptime: process.uptime(),
     lastUpdate: cache.lastUpdate, counts: cache.counts,
     caches: { details: detailsCache.size, streams: streamCache.size }
   });
@@ -2288,7 +2417,7 @@ app.get('/health', (req, res) => {
 
 app.get('/', (req, res) => {
   res.json({
-    name: 'Sir TV Live Server', version: '4.1', status: 'running',
+    name: 'Sir TV Live Server', version: '4.3', status: 'running',
     features: ['news', 'highlights', 'match-extras', 'player', 'league-follow', 'matches', 'leagues', 'standings', 'scorers', 'fixtures', 'push-notifications', 'rich-details-fotmob', 'full-hls-proxy', 'team-follow', 'ranks', 'time-fix'],
     endpoints: {
       matches: 'GET /api/matches',
@@ -2302,6 +2431,7 @@ app.get('/', (req, res) => {
       team: 'GET /api/team/:id',
       news: 'GET /api/news?topics=a|b',
       newsStatus: 'GET /api/news/status',
+      article: 'GET /api/article?url=',
       highlights: 'GET /api/highlights?q=',
       extras: 'GET /api/match/extras?home=&away=&link=',
       player: 'GET /api/player/:id',
