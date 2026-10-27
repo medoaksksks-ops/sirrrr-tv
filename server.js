@@ -1,6 +1,18 @@
 /**
- * Sir TV Live Server v3.9
+ * Sir TV Live Server v4.1
  * ------------------------------------------------------------
+ * v4.1:
+ *  - البث: لو السيرفر مقدرش يطلع رابط HLS، /api/stream بيرجّع رابط الـ iframe (مشغّل المصدر)
+ *    عشان الصفحة تشغّله بدل ما المباراة متشتغلش خالص (type:'iframe' + embedUrl)
+ * v4.0:
+ *  - أخبار كورة: GET /api/news (عام / topics=فريق|دوري) + /api/news/status لفحص المصادر
+ *    (متغير NEWS_FEEDS = JSON لإضافة مصادر RSS)
+ *  - ملخصات: GET /api/highlights?q= + ملخص الماتش الرسمي من FotMob
+ *    (متغير HL_CHANNELS = channel_id[:اسم],... لقنوات يوتيوب مفضلة)
+ *  - GET /api/match/extras : ملخص نصي تلقائي + فيديوهات + أخبار المباراة
+ *  - GET /api/player/:id : بيانات اللاعب (مركز/سن/قيمة/إحصائيات/آخر المباريات)
+ *  - الهدافين: assists + ترتيب فريق اللاعب
+ *  - إشعارات: متابعة دوري كامل (leagues في الاشتراك)
  * v3.9:
  *  - توقيت المباريات: تصحيح فرق الساعتين + عرض بتوقيت القاهرة
  *      (SRC_SHIFT_MIN / START_ADJUST_MIN / DISPLAY_TZ من متغيرات Railway)
@@ -67,7 +79,7 @@ const io = new Server(server, { cors: { origin: true }, pingInterval: 20000, pin
 let cache = {
   matches: [], live: [], finished: [], upcoming: [],
   counts: { total: 0, live: 0, finished: 0, upcoming: 0 },
-  lastUpdate: null, error: null, version: '3.9'
+  lastUpdate: null, error: null, version: '4.1'
 };
 
 const detailsCache = new Map();
@@ -90,7 +102,7 @@ function to12Hour(timeStr) {
 }
 
 // ========== TIME (Africa/Cairo) ==========
-const VERSION = '3.9';
+const VERSION = '4.1';
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch (_) {}
 const envNum = (k, d) => { const v = process.env[k]; if (v === undefined || v === '') return d; const n = Number(v); return Number.isFinite(n) ? n : d; };
@@ -1021,6 +1033,8 @@ async function enrichFromFotmob(details, home, away, startIso) {
   };
 
   details.stats = mapFotmobStats(content.stats?.Periods);
+  { const hl = content.matchFacts && content.matchFacts.highlights;
+    if (hl && (hl.url || hl.image)) details.highlight = { url: hl.url || null, image: hl.image || null, source: hl.source || null }; }
 
   // ---- الأحداث الكاملة (أهداف / كروت / تبديلات / VAR) ----
   const all = [...details.homeLineup, ...details.awayLineup, ...details.homeSubs, ...details.awaySubs];
@@ -1201,7 +1215,7 @@ async function fetchMatchDetails(matchLink, externalId, home, away) {
 }
 
 // ========== STREAM ==========
-async function resolveStream(matchLink) {
+async function resolveStream(matchLink, ctx = {}) {
   if (!matchLink) throw new Error('No link provided');
   const hit = streamCache.get(matchLink);
   if (hit && Date.now() - hit.ts < STREAM_TTL) return hit.data;
@@ -1215,11 +1229,13 @@ async function resolveStream(matchLink) {
     if (mid) playerUrl = `https://n1.sirftv.com/hard/player.html?match=${mid[1]}`;
   }
   if (!playerUrl) throw new Error('Player page not found');
+  ctx.embed = playerUrl;
 
   const page2 = await get(playerUrl, { headers: { ...headers, Referer: matchLink } }, 1);
   let streams = extractStreams(page2.data);
   if (streams.length) {
     const result = buildResult(streams, playerUrl);
+    result.embed = ctx.embed;
     streamCache.set(matchLink, { ts: Date.now(), data: result });
     return result;
   }
@@ -1227,12 +1243,14 @@ async function resolveStream(matchLink) {
   let finalPlayer = extractFinalPlayer(page2.data, playerUrl);
   if (!finalPlayer) throw new Error('Final player not found');
   if (!finalPlayer.startsWith('http')) finalPlayer = new URL(finalPlayer, playerUrl).href;
+  ctx.embed = finalPlayer;
 
   const page3 = await get(finalPlayer, { headers: { ...headers, Referer: playerUrl } }, 1);
   streams = extractStreams(page3.data);
   if (!streams.length) throw new Error('No stream URL found');
 
   const result = buildResult(streams, finalPlayer);
+  result.embed = ctx.embed;
   streamCache.set(matchLink, { ts: Date.now(), data: result });
   return result;
 }
@@ -1555,6 +1573,19 @@ async function fetchLeagueDetails(leagueId) {
     }));
   }
 
+  // v4.0: assists كاملة + ترتيب فريق اللاعب
+  try {
+    if (ass && ass.fetchAllUrl) {
+      const fa = await fetchFullScorers(ass.fetchAllUrl);
+      if (fa.length) assists = fa.map(p => ({ ...p, assists: p.goals, goals: undefined }));
+    }
+    const amap = new Map(assists.map(a => [Number(a.id), a.assists]));
+    const srow = new Map(standings.map(s => [Number(s.id), s]));
+    const enrichP = p => { const t = srow.get(Number(p.teamId)); p.teamNameAr = p.teamName ? trAr(p.teamName) : null; if (t) { p.teamRank = t.rank; p.teamPlayed = t.played; } };
+    scorers.forEach(p => { if (amap.has(Number(p.id))) p.assists = amap.get(Number(p.id)); enrichP(p); });
+    assists.forEach(enrichP);
+  } catch (e) { console.error('[scorers enrich]', e.message); }
+
   const meta = LEAGUES.find(l => l.id === id) || {};
   const result = {
     id,
@@ -1615,6 +1646,7 @@ function indexSub(e) {
   e._tn = new Set();
   for (const t of e.teams || []) for (const n of t.names || []) { const k = normAr(n); if (k) { e._tn.add(k); e._tn.add(stripAl(k)); } }
   e._mk = new Set((e.matches || []).map(String));
+  e._lg = new Set((e.leagues || []).map(Number).filter(Boolean));
   return e;
 }
 function loadSubs() {
@@ -1632,7 +1664,7 @@ function saveSubs() {
   clearTimeout(saveT);
   saveT = setTimeout(() => {
     try {
-      const arr = [...pushSubs.values()].map(({ _tid, _tn, _mk, ...rest }) => rest);
+      const arr = [...pushSubs.values()].map(({ _tid, _tn, _mk, _lg, ...rest }) => rest);
       fs.writeFileSync(SUBS_FILE, JSON.stringify(arr));
     } catch (e) { console.error('[Push] saveSubs', e.message); }
   }, 500);
@@ -1645,12 +1677,13 @@ function cleanBody(b) {
     names: (Array.isArray(t.names) ? t.names : []).slice(0, 10).map(x => String(x).slice(0, 60))
   }));
   const matches = (Array.isArray(b.matches) ? b.matches : []).slice(0, 200).map(x => String(x).slice(0, 300));
+  const leagues = (Array.isArray(b.leagues) ? b.leagues : []).slice(0, 30).map(Number).filter(Boolean);
   const p = b.prefs || {};
   const prefs = {
     goals: p.goals === 'mine' ? 'mine' : 'all',
     remind: p.remind !== false, kickoff: p.kickoff !== false, final: p.final !== false
   };
-  return { teams, matches, prefs };
+  return { teams, matches, leagues, prefs };
 }
 function upsertSub(body) {
   const { subscription } = body || {};
@@ -1681,6 +1714,7 @@ async function pushMany(list, payload, ttl) {
 
 function followsMatch(e, m) {
   if (e._mk.has(String(m.key))) return true;
+  if (m.league && m.league.id && e._lg.has(Number(m.league.id))) return true;
   if (m.homeId && e._tid.has(m.homeId)) return true;
   if (m.awayId && e._tid.has(m.awayId)) return true;
   for (const n of [m.home, m.away]) { const k = normAr(n); if (e._tn.has(k) || e._tn.has(stripAl(k))) return true; }
@@ -1750,6 +1784,259 @@ function notifyTick(matches) {
       }
     }
   }
+}
+
+// ========== v4.0: أخبار / ملخصات / ملخص تلقائي / لاعب ==========
+const NEWS_TTL = 10 * 60 * 1000;
+const gnews = q => `https://news.google.com/rss/search?q=${encodeURIComponent(q)}&hl=ar&gl=EG&ceid=EG:ar`;
+let NEWS_FEEDS = [
+  { id: 'gn-football', name: 'أخبار كرة القدم', url: gnews('كرة القدم when:2d') },
+  { id: 'gn-egypt',    name: 'الكرة المصرية',    url: gnews('الدوري المصري when:2d') },
+  { id: 'gn-world',    name: 'الكرة العالمية',   url: gnews('الدوري الإنجليزي OR الدوري الإسباني OR دوري أبطال أوروبا when:2d') },
+  { id: 'bbc-sport',   name: 'BBC عربي رياضة',  url: 'https://feeds.bbci.co.uk/arabic/sports/rss.xml' }
+];
+try {
+  const extra = JSON.parse(process.env.NEWS_FEEDS || '[]');   // [{id,name,url}]
+  if (Array.isArray(extra)) NEWS_FEEDS = NEWS_FEEDS.concat(extra.filter(f => f && f.url));
+} catch (_) {}
+const HL_CHANNELS = String(process.env.HL_CHANNELS || '').split(',').map(s => s.trim()).filter(Boolean); // channel_id أو channel_id:اسم
+
+const feedCache = new Map();   // url → { ts, items, ok, err }
+const feedStatus = new Map();  // id → { ok, count, err, ts }
+const ytCache = new Map();     // q → { ts, items }
+
+function stripHtml(s) {
+  return String(s || '').replace(/<[^>]*>/g, ' ').replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/\s+/g, ' ').trim();
+}
+function hashStr(s) { let h = 5381; for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0; return (h >>> 0).toString(36); }
+
+function xmlUnesc(s) {
+  return String(s || '').replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, '$1').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&apos;|&#39;/g, "'").replace(/&amp;/g, '&');
+}
+const xmlTag = (blk, tag) => { const m = blk.match(new RegExp('<' + tag + '(?:\\s[^>]*)?>([\\s\\S]*?)</' + tag + '>', 'i')); return m ? xmlUnesc(m[1]).trim() : ''; };
+const xmlAttr = (blk, tag, attr) => { const m = blk.match(new RegExp('<' + tag + '\\s[^>]*?' + attr + '=["\']([^"\']+)["\']', 'i')); return m ? xmlUnesc(m[1]) : null; };
+function parseRss(xml, feedName) {
+  const out = [];
+  const blocks = String(xml).match(/<(item|entry)[\s>][\s\S]*?<\/\1>/gi) || [];
+  for (const blk of blocks) {
+    let title = xmlTag(blk, 'title');
+    let link = xmlTag(blk, 'link') || xmlAttr(blk, 'link', 'href') || '';
+    if (!title || !link) continue;
+    let source = xmlTag(blk, 'source') || feedName;
+    const m = title.match(/^(.*\S)\s+-\s+([^-]{2,40})$/);
+    if (m && /news\.google\./.test(link)) { title = m[1]; source = m[2]; }
+    const ts = Date.parse(xmlTag(blk, 'pubDate') || xmlTag(blk, 'published') || xmlTag(blk, 'updated') || '') || null;
+    const descRaw = xmlTag(blk, 'description') || xmlTag(blk, 'summary');
+    let img = xmlAttr(blk, 'media:thumbnail', 'url') || xmlAttr(blk, 'media:content', 'url') || xmlAttr(blk, 'enclosure', 'url');
+    if (!img) { const im = descRaw.match(/<img[^>]+src=["']([^"']+)/i); if (im) img = im[1]; }
+    title = stripHtml(title);
+    let summary = stripHtml(descRaw);
+    if (summary.length < 25 || summary.startsWith(title.slice(0, 20))) summary = '';
+    out.push({ id: hashStr(link), title, link, source: stripHtml(source), ts, img, summary: summary.slice(0, 240) });
+  }
+  return out;
+}
+
+async function fetchFeed(url, name) {
+  const hit = feedCache.get(url);
+  if (hit && Date.now() - hit.ts < NEWS_TTL) return hit;
+  try {
+    const r = await axios.get(url, { headers: { 'User-Agent': UA, Accept: 'application/rss+xml,application/xml,text/xml,*/*' }, timeout: 12000, responseType: 'text', validateStatus: s => s < 500 });
+    if (r.status !== 200) throw new Error('HTTP ' + r.status);
+    const items = parseRss(String(r.data), name);
+    const rec = { ts: Date.now(), items, ok: true };
+    feedCache.set(url, rec);
+    return rec;
+  } catch (e) {
+    const rec = { ts: Date.now() - NEWS_TTL + 60 * 1000, items: (hit && hit.items) || [], ok: false, err: e.message }; // نعيد المحاولة بعد دقيقة
+    feedCache.set(url, rec);
+    return rec;
+  }
+}
+
+function dedupeNews(list) {
+  const seen = new Set(), out = [];
+  for (const n of list.sort((a, b) => (b.ts || 0) - (a.ts || 0))) {
+    const k = normAr(n.title).slice(0, 48);
+    if (seen.has(k) || seen.has(n.id)) continue;
+    seen.add(k); seen.add(n.id); out.push(n);
+  }
+  return out;
+}
+
+async function getGeneralNews() {
+  const res = await Promise.all(NEWS_FEEDS.map(async f => {
+    const r = await fetchFeed(f.url, f.name);
+    feedStatus.set(f.id, { name: f.name, ok: r.ok, count: r.items.length, err: r.err || null, ts: r.ts });
+    return r.items.map(i => ({ ...i, feed: f.id }));
+  }));
+  return dedupeNews(res.flat());
+}
+async function getTopicNews(q, name) {
+  const r = await fetchFeed(gnews(`${q} كرة القدم when:7d`), name || q);
+  return r.items.map(i => ({ ...i, topic: q }));
+}
+
+// ---- يوتيوب: بحث عن ملخصات ----
+function ytWalk(o, out) {
+  if (!o || typeof o !== 'object') return;
+  if (o.videoRenderer && o.videoRenderer.videoId) {
+    const v = o.videoRenderer;
+    out.push({
+      id: v.videoId,
+      title: (v.title && (v.title.runs || []).map(r => r.text).join('')) || '',
+      channel: (v.ownerText && v.ownerText.runs && v.ownerText.runs[0] && v.ownerText.runs[0].text) || '',
+      dur: (v.lengthText && v.lengthText.simpleText) || '',
+      ago: (v.publishedTimeText && v.publishedTimeText.simpleText) || '',
+      views: (v.shortViewCountText && v.shortViewCountText.simpleText) || '',
+      thumb: `https://i.ytimg.com/vi/${v.videoId}/hqdefault.jpg`
+    });
+    return;
+  }
+  for (const k in o) ytWalk(o[k], out);
+}
+async function ytSearch(q) {
+  const hit = ytCache.get(q);
+  if (hit && Date.now() - hit.ts < 20 * 60 * 1000) return hit.items;
+  let items = [];
+  try {
+    const r = await axios.get('https://www.youtube.com/results', {
+      params: { search_query: q, hl: 'ar', gl: 'EG', sp: 'EgIQAQ%253D%253D' },
+      headers: { 'User-Agent': UA, 'Accept-Language': 'ar,en;q=0.8', Cookie: 'CONSENT=YES+1' },
+      timeout: 12000, responseType: 'text', validateStatus: s => s < 500
+    });
+    const m = String(r.data).match(/var ytInitialData\s*=\s*(\{.*?\});<\/script>/s);
+    if (m) { const out = []; ytWalk(JSON.parse(m[1]), out); items = out; }
+  } catch (e) { console.error('[yt]', e.message); }
+  ytCache.set(q, { ts: Date.now() - (items.length ? 0 : 15 * 60 * 1000), items });
+  return items;
+}
+async function ytChannelFeed(spec) {
+  const [cid, ...rest] = spec.split(':');
+  const r = await fetchFeed(`https://www.youtube.com/feeds/videos.xml?channel_id=${cid}`, rest.join(':') || cid);
+  return r.items.map(i => {
+    const vid = (String(i.link).match(/[?&]v=([\w-]{6,})/) || [])[1];
+    return vid ? { id: vid, title: i.title, channel: i.source, ago: '', dur: '', thumb: `https://i.ytimg.com/vi/${vid}/hqdefault.jpg`, ts: i.ts } : null;
+  }).filter(Boolean);
+}
+const HL_RX = /ملخص|أهداف|اهداف|highlights|goals/i;
+async function getHighlights(q) {
+  let vids = await ytSearch(q);
+  vids = vids.filter(v => HL_RX.test(v.title));
+  if (HL_CHANNELS.length && q) {
+    const chs = (await Promise.all(HL_CHANNELS.map(ytChannelFeed))).flat();
+    const qs = normAr(q).split(' ').filter(w => w.length > 2);
+    const hit = chs.filter(v => { const t = normAr(v.title); return qs.filter(w => t.includes(w)).length >= Math.min(2, qs.length); });
+    vids = hit.concat(vids);
+  }
+  const seen = new Set();
+  return vids.filter(v => !seen.has(v.id) && seen.add(v.id)).slice(0, 8);
+}
+
+// ---- ملخص نصي تلقائي للمباراة (من بيانات FotMob) ----
+function buildSummary(d, home, away) {
+  if (!d || !d.info) return null;
+  const hs = d.info.homeScore, as = d.info.awayScore;
+  const h = home || trAr(d.info.home), a = away || trAr(d.info.away);
+  const evs = d.events || [];
+  const isGoal = e => /goal|هدف/i.test(e.type || '') && !/disallow|cancel|miss/i.test(e.type || '');
+  const goals = evs.filter(isGoal);
+  const reds = evs.filter(e => /red/i.test(e.type || ''));
+  const fin = /full|ft|انتهت|finished/i.test(d.info.status || '') || (d.info.status && /ended/i.test(d.info.status));
+  const lines = [];
+  const hasScore = hs != null && as != null;
+  if (hasScore) {
+    if (fin) lines.push(hs === as ? `انتهت المباراة بالتعادل ${hs}-${as} بين ${h} و${a}.` : `انتهت المباراة بفوز ${hs > as ? h : a} على ${hs > as ? a : h} بنتيجة ${Math.max(hs, as)}-${Math.min(hs, as)}.`);
+    else lines.push(`النتيجة الحالية: ${h} ${hs} - ${as} ${a}.`);
+  }
+  if (goals.length) {
+    const g = goals.map(e => `${e.player || e.text || '؟'}${e.minute ? ` (${String(e.minute).replace(/'$/, '')}')` : ''}${/own/i.test(e.type) ? ' [عكسي]' : ''}${/pen/i.test(e.type + (e.detail || '')) ? ' [ركلة جزاء]' : ''}`);
+    lines.push('الأهداف: ' + g.join('، ') + '.');
+  }
+  if (reds.length) lines.push('طرد: ' + reds.map(e => `${e.player || e.text || '؟'}${e.minute ? ` (${e.minute}')` : ''}`).join('، ') + '.');
+  const poss = (d.stats || []).flatMap(g => g.stats || g.items || []).find(s => /possession|استحواذ/i.test(s.title || s.name || ''));
+  if (poss && poss.home != null && poss.away != null) lines.push(`الاستحواذ: ${h} ${poss.home}% مقابل ${poss.away}% لـ${a}.`);
+  const i = d.info;
+  const where = [i.stadium, i.city].filter(Boolean).join(' - ');
+  if (where) lines.push('الملعب: ' + where + (i.referee ? ` • الحكم: ${i.referee}` : '') + '.');
+  if (i.competition) lines.push('البطولة: ' + i.competition + (i.round ? ` (${i.round})` : '') + '.');
+  return lines.length ? lines : null;
+}
+
+const extrasCache = new Map();
+async function getExtras({ link, id, home, away, hAr, aAr }) {
+  const ck = `${link || ''}|${id || ''}|${home || ''}|${away || ''}|${hAr || ''}|${aAr || ''}`;
+  const hit = extrasCache.get(ck);
+  if (hit && Date.now() - hit.ts < 5 * 60 * 1000) return hit.data;
+  let d = null;
+  try { d = await fetchMatchDetails(link, id, home, away); } catch (_) {}
+  const finished = d && d.info && /full|ft|انتهت|ended|finished/i.test(d.info.status || '');
+  const h = hAr || home || (d && d.info && trAr(d.info.home)), a = aAr || away || (d && d.info && trAr(d.info.away));
+  const jobs = [
+    (finished || (d && d.highlight)) && h && a ? getHighlights(`${h} ${a} ملخص`) : Promise.resolve([]),
+    h && a ? getTopicNews(`${h} ${a}`, 'المباراة') : Promise.resolve([])
+  ];
+  const [vids, news] = await Promise.all(jobs);
+  const data = {
+    summary: buildSummary(d, h, a),
+    officialHighlight: (d && d.highlight) || null,
+    videos: vids,
+    news: news.slice(0, 6),
+    searchUrl: h && a ? `https://www.youtube.com/results?search_query=${encodeURIComponent(`${h} ${a} ملخص`)}` : null,
+    finished: !!finished
+  };
+  extrasCache.set(ck, { ts: Date.now(), data });
+  return data;
+}
+
+// ---- بيانات اللاعب (FotMob playerData) ----
+const playerCache = new Map();
+const INFO_AR = { height: 'الطول', shirt: 'رقم القميص', age: 'السن', preferred_foot: 'القدم المفضلة', country: 'الجنسية', transfer_value: 'القيمة السوقية', contract_end: 'نهاية العقد', position: 'المركز' };
+const FOOT_AR = { right: 'اليمنى', left: 'اليسرى', both: 'الاتنين', Right: 'اليمنى', Left: 'اليسرى', Both: 'الاتنين' };
+async function getPlayer(id) {
+  id = Number(id);
+  const hit = playerCache.get(id);
+  if (hit && Date.now() - hit.ts < 30 * 60 * 1000) return hit.data;
+  const d = await fotmobGet(`https://www.fotmob.com/api/data/playerData?id=${id}`);
+  if (!d || !d.name) return null;
+  const info = [];
+  const val = v => { if (v == null) return null; if (typeof v !== 'object') return String(v); const x = v.fallback ?? v.numberValue ?? v.key ?? null; return x == null ? null : String(x); };
+  for (const it of d.playerInformation || []) {
+    const key = it.translationKey || (it.title && it.title.key) || '';
+    let value = val(it.value);
+    if (value == null) continue;
+    if (key === 'preferred_foot') value = FOOT_AR[value] || value;
+    if (key === 'country') value = trAr(value);
+    const unit = it.value && it.value.numberValue != null && key === 'height' ? ' سم' : '';
+    info.push({ key, label: INFO_AR[key] || (it.title && it.title.fallback) || (typeof it.title === 'string' ? it.title : key), value: value + unit });
+  }
+  const bd = d.birthDate && (d.birthDate.utcTime || d.birthDate);
+  const stats = [];
+  const ml = d.mainLeague || {};
+  for (const s of ml.stats || []) {
+    const v = s.value != null ? s.value : s.statValue;
+    if (v == null || !(s.title || s.localizedTitleId)) continue;
+    stats.push({ key: s.localizedTitleId || s.title, title: s.title || s.localizedTitleId, value: v });
+  }
+  const pos = d.positionDescription || {};
+  const recent = (d.recentMatches || []).slice(0, 6).map(m => ({
+    date: m.matchDate && (m.matchDate.utcTime || m.matchDate), opp: m.opponentTeamName || null,
+    home: m.isHomeTeam, score: m.homeScore != null ? `${m.homeScore}-${m.awayScore}` : null,
+    rating: m.ratingProps && m.ratingProps.num ? m.ratingProps.num : null,
+    goals: m.goals || 0, assists: m.assists || 0, minutes: m.minutesPlayed || null
+  }));
+  const data = {
+    id, name: d.name, photo: fotmobPhoto(id),
+    teamId: d.primaryTeam && d.primaryTeam.teamId, team: d.primaryTeam && d.primaryTeam.teamName,
+    teamAr: d.primaryTeam && d.primaryTeam.teamName ? trAr(d.primaryTeam.teamName) : null,
+    teamLogo: d.primaryTeam && d.primaryTeam.teamId ? `https://images.fotmob.com/image_resources/logo/teamlogo/${d.primaryTeam.teamId}_small.png` : null,
+    position: (pos.primaryPosition && pos.primaryPosition.label) || null,
+    positions: (pos.positions || []).map(p => p.strPos && p.strPos.label || p.label).filter(Boolean),
+    birth: bd || null, captain: !!d.isCaptain,
+    info, league: ml.leagueName || null, season: ml.season || null, stats, recent
+  };
+  playerCache.set(id, { ts: Date.now(), data });
+  return data;
 }
 
 // ========== ROUTES ==========
@@ -1851,6 +2138,44 @@ app.get('/api/team/:id', async (req, res) => {
 });
 
 // بيرجّع الوقت الخام من المصدر والوقت بعد التصحيح — عشان تتأكد من SRC_SHIFT_MIN
+// ===== v4.0: routes =====
+app.get('/api/news', async (req, res) => {
+  try {
+    const limit = Math.min(60, Number(req.query.limit) || 30);
+    const topics = String(req.query.topics || req.query.team || req.query.league || '').split('|').map(s => s.trim()).filter(Boolean).slice(0, 6);
+    let items;
+    if (topics.length) items = dedupeNews((await Promise.all(topics.map(t => getTopicNews(t)))).flat());
+    else items = await getGeneralNews();
+    res.json({ success: true, count: items.length, items: items.slice(0, limit), updatedAt: new Date().toISOString() });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+app.get('/api/news/status', (req, res) => {
+  res.json({ success: true, feeds: NEWS_FEEDS.map(f => ({ id: f.id, url: f.url, ...(feedStatus.get(f.id) || { ok: null }) })), highlightsChannels: HL_CHANNELS });
+});
+app.get('/api/highlights', async (req, res) => {
+  try {
+    const q = String(req.query.q || '').trim() || 'ملخص مباراة اليوم كرة القدم';
+    res.json({ success: true, items: await getHighlights(q) });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+app.get('/api/match/extras', async (req, res) => {
+  const link = req.query.link ? decodeURIComponent(req.query.link) : null;
+  const id = req.query.id || null;
+  const home = req.query.home ? decodeURIComponent(req.query.home) : null;
+  const away = req.query.away ? decodeURIComponent(req.query.away) : null;
+  if (!link && !id && !(home && away)) return res.status(400).json({ success: false, error: 'link, id, or home+away required' });
+  const hAr = req.query.hAr ? String(req.query.hAr).slice(0, 60) : null, aAr = req.query.aAr ? String(req.query.aAr).slice(0, 60) : null;
+  try { res.json({ success: true, ...(await getExtras({ link, id, home, away, hAr, aAr })) }); }
+  catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+app.get('/api/player/:id', async (req, res) => {
+  try {
+    const p = await getPlayer(req.params.id);
+    if (!p) return res.status(404).json({ success: false, error: 'not found' });
+    res.json({ success: true, player: p });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
 app.get('/api/debug/time', (req, res) => {
   res.json({
     success: true, version: VERSION, tz: TZ, SRC_SHIFT_MIN, START_ADJUST_MIN,
@@ -1922,8 +2247,12 @@ app.post('/api/refresh', async (req, res) => {
 app.get('/api/stream', async (req, res) => {
   const link = req.query.link;
   if (!link) return res.status(400).json({ success: false, error: 'link required' });
+  const ctx = {};
+  const mlink = decodeURIComponent(link);
+  const idm = mlink.match(/[?&]m=(\d+)/);
+  const fallbackEmbed = () => ctx.embed || (idm ? `https://n1.sirftv.com/hard/player.html?match=${idm[1]}` : null);
   try {
-    const result = await resolveStream(decodeURIComponent(link));
+    const result = await resolveStream(mlink, ctx);
     const host = `${req.protocol}://${req.get('host')}`;
     const ref = encodeURIComponent(result.referer || '');
     const qualities = (result.qualities || []).map(q => ({
@@ -1933,10 +2262,12 @@ app.get('/api/stream', async (req, res) => {
     const playUrl = `${host}/proxy?url=${encodeURIComponent(result.streamUrl)}&ref=${ref}`;
     res.json({
       success: true, playUrl, qualities, quality: result.quality,
-      type: 'hls', proxied: true, resolvedAt: result.resolvedAt
+      type: 'hls', proxied: true, resolvedAt: result.resolvedAt, embedUrl: result.embed || fallbackEmbed()
     });
   } catch (e) {
     console.error('[Stream]', e.message);
+    const emb = fallbackEmbed();
+    if (emb) return res.json({ success: true, type: 'iframe', embedUrl: emb, fallback: true, reason: e.message });
     res.status(500).json({ success: false, error: e.message });
   }
 });
@@ -1949,7 +2280,7 @@ app.get('/proxy', async (req, res) => {
 
 app.get('/health', (req, res) => {
   res.json({
-    status: 'ok', version: '3.9', uptime: process.uptime(),
+    status: 'ok', version: '4.1', uptime: process.uptime(),
     lastUpdate: cache.lastUpdate, counts: cache.counts,
     caches: { details: detailsCache.size, streams: streamCache.size }
   });
@@ -1957,18 +2288,23 @@ app.get('/health', (req, res) => {
 
 app.get('/', (req, res) => {
   res.json({
-    name: 'Sir TV Live Server', version: '3.9', status: 'running',
-    features: ['matches', 'leagues', 'standings', 'scorers', 'fixtures', 'push-notifications', 'rich-details-fotmob', 'full-hls-proxy', 'team-follow', 'ranks', 'time-fix'],
+    name: 'Sir TV Live Server', version: '4.1', status: 'running',
+    features: ['news', 'highlights', 'match-extras', 'player', 'league-follow', 'matches', 'leagues', 'standings', 'scorers', 'fixtures', 'push-notifications', 'rich-details-fotmob', 'full-hls-proxy', 'team-follow', 'ranks', 'time-fix'],
     endpoints: {
       matches: 'GET /api/matches',
       leagues: 'GET /api/leagues',
       league: 'GET /api/league/:id',
-      stream: 'GET /api/stream?link=',
+      stream: 'GET /api/stream?link=  (type=hls أو iframe احتياطي)',
       details: 'GET /api/match/details?link=&id=&home=&away=',
       health: 'GET /health',
       ranks: 'GET /api/ranks',
       teamSearch: 'GET /api/teams/search?q=',
       team: 'GET /api/team/:id',
+      news: 'GET /api/news?topics=a|b',
+      newsStatus: 'GET /api/news/status',
+      highlights: 'GET /api/highlights?q=',
+      extras: 'GET /api/match/extras?home=&away=&link=',
+      player: 'GET /api/player/:id',
       debugTime: 'GET /api/debug/time'
     }
   });
