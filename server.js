@@ -48,18 +48,6 @@ const path = require('path');
 const webpush = require('web-push');
 
 const app = express();
-
-// Build absolute URLs that browsers can use from HTTPS sites behind Railway.
-// Express may see the internal HTTP connection and req.protocol can therefore
-// produce insecure http:// playlist/segment URLs unless the proxy headers are trusted.
-function publicBaseUrl(req) {
-  const host = String(req.get('host') || '').trim();
-  const forwardedProto = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim().toLowerCase();
-  const isRailwayHost = /(^|\.)up\.railway\.app$/i.test(host);
-  const proto = isRailwayHost || forwardedProto === 'https' || req.secure ? 'https' : 'http';
-  return `${proto}://${host}`;
-}
-
 const server = http.createServer(app);
 const PORT = process.env.PORT || 3000;
 const SOURCE = 'https://sir-tv.vip/';
@@ -1363,10 +1351,15 @@ async function proxyHls(req, res, targetUrl, referer) {
             Connection: 'keep-alive'
           };
 
+    // Brightcove HLS uses a master playlist, child playlists, and fragmented MP4
+    // media/init segments. Preserve byte-range requests for those media files.
+    if (req.headers.range) requestHeaders.Range = req.headers.range;
+    requestHeaders['Accept-Encoding'] = 'identity';
+
     const response = await axios.get(targetUrl, {
       headers: requestHeaders,
       responseType: 'arraybuffer',
-      timeout: 22000,
+      timeout: 30000,
       maxRedirects: 5,
       validateStatus: () => true
     });
@@ -1384,19 +1377,31 @@ async function proxyHls(req, res, targetUrl, referer) {
     if (isPlaylist) {
       let body = Buffer.from(response.data).toString('utf8');
       const base = new URL(targetUrl);
-      const host = publicBaseUrl(req);
+      const host = `${req.protocol}://${req.get('host')}`;
       const proxyBase = `${host}/proxy?url=`;
       const refQ = (mk ? `&k=${encodeURIComponent(String(req.query.k))}` : '') + (referer ? `&ref=${encodeURIComponent(referer)}` : '');
       body = body.replace(/(https?:\/\/[^\s\n\r"']+)/g, m => proxyBase + encodeURIComponent(m) + refQ);
-      body = body.replace(/^([a-zA-Z0-9_\-\.\/]+\.(ts|m4s|key|m3u8)[^\s]*)$/gm, m => {
-        try { return proxyBase + encodeURIComponent(new URL(m, base).href) + refQ; } catch { return m; }
+      // Rewrite relative HLS references, including Brightcove .mp4 media and
+      // initialization segments (not just .ts/.m4s). Keep optional query strings.
+      body = body.replace(/^([^#\s][^\r\n]*\.(?:ts|m4s|mp4|aac|key|m3u8)(?:\?[^\s]*)?)$/gmi, m => {
+        try {
+          const trimmed = m.trim();
+          if (/^https?:\/\//i.test(trimmed)) return proxyBase + encodeURIComponent(trimmed) + refQ;
+          return proxyBase + encodeURIComponent(new URL(trimmed, base).href) + refQ;
+        } catch { return m; }
       });
       body = body.replace(/URI="([^"]+)"/g, (m0, u) => { if (u.startsWith(proxyBase)) return m0; try { return 'URI="' + proxyBase + encodeURIComponent(new URL(u, base).href) + refQ + '"'; } catch { return m0; } });
       res.set('Content-Type', 'application/vnd.apple.mpegurl');
       return res.send(body);
     }
 
+    // Preserve upstream status and range metadata. Brightcove's media segments
+    // may respond with 206 Partial Content; returning them as 200 breaks playback.
+    res.status(response.status);
     res.set('Content-Type', ct || 'application/octet-stream');
+    for (const h of ['content-length', 'content-range', 'accept-ranges', 'last-modified', 'etag']) {
+      if (response.headers[h] != null) res.set(h, String(response.headers[h]));
+    }
     return res.send(Buffer.from(response.data));
   } catch (err) {
     console.error('[Proxy]', err.message);
@@ -2593,7 +2598,7 @@ app.get('/api/stream', async (req, res) => {
   const mlink = decodeURIComponent(link);
   const man = manualFor(req.query.key ? String(req.query.key) : null, mlink);
   if (man && man.sources && man.sources.length) {
-    const host0 = publicBaseUrl(req), sk = safeKey(man.key);
+    const host0 = `${req.protocol}://${req.get('host')}`, sk = safeKey(man.key);
     const qs = man.sources.map(s => ({ label: s.label || 'HD', url: man.mode === 'direct' ? s.url : `${host0}/proxy?url=${encodeURIComponent(s.url)}&k=${encodeURIComponent(sk)}` }));
     return res.json({ success: true, playUrl: qs[0].url, qualities: qs, quality: qs[0].label, type: 'hls', proxied: man.mode !== 'direct', manual: true, embedUrl: man.embed || null, resolvedAt: new Date().toISOString() });
   }
@@ -2602,7 +2607,7 @@ app.get('/api/stream', async (req, res) => {
   const fallbackEmbed = () => ctx.embed || null;
   try {
     const result = await resolveStream(mlink, ctx);
-    const host = publicBaseUrl(req);
+    const host = `${req.protocol}://${req.get('host')}`;
     const ref = encodeURIComponent(result.referer || '');
     const qualities = (result.qualities || []).map(q => ({
       label: q.label,
