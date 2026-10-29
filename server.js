@@ -1,41 +1,16 @@
 /**
- * Sir TV Live Server v5.2
+ * Sir TV Live Server v5.4
  * ------------------------------------------------------------
- * v5.2:
- *  - الهيدرز ثابتة جوه السيرفر (Origin/Referer/UA/Accept/Cookie بتوع المصدر) — من اللوحة بتحط رابط البث بس
- *    وممكن تتغيّر من Railway: STREAM_REFERER / STREAM_ORIGIN / STREAM_UA / STREAM_COOKIE / STREAM_ACCEPT
- * v5.1:
- *  - الطلب للمصدر بيتبعت بنفس هيدرز المتصفح بالظبط: Origin / Referer / User-Agent / Accept / Accept-Encoding: identity / Cookie / Connection: keep-alive
+ * v5.4:
+ *  - دعم Syria Player (syria-player.info → S3): /api/stream بيتعرف على روابط زي
+ *    https://1cdn.syria-player.info/bein1 ويترجمها لـ https://1sisi.s3.us-east-2.amazonaws.com/bein1/master.m3u8
+ *    بنفس هيدرز تطبيق SoulBrowser (sec-ch-ua, X-Requested-With, Origin...)
+ *  - /proxy بيعيد كتابة الروابط النسبية في الـ m3u8 بشكل صحيح (نسبي لمسار المشغّل)
+ *  - /api/syria/test لفحص الرابط خطوة بخطوة
+ * v5.3:
+ *  - الهيدرز ثابتة جوه السيرفر (Origin/Referer/UA/Accept/Cookie بتوع المصدر)
  * v5.0:
  *  - نظام بث يدوي: لوحة تحكم (admin) بتحط رابط m3u8 لكل ماتش، بيتحفظ في Firebase
- *    والسيرفر بيشغّله عبر بروكسي بنفس Referer/Origin/User-Agent. متغيرات: ADMIN_PASSWORD, FIREBASE_DB_URL, FIREBASE_SECRET
- *    مسارات: /api/admin/{login,matches,stream,test} — و /api/stream بيدّي الأولوية للرابط اليدوي
- * v4.3:
- *  - GET /api/article?url= : قارئ مقالات جوه الموقع (بيفك روابط أخبار جوجل ويطلّع النص والصورة)
- * v4.2:
- *  - استخراج رابط البث أقوى: بيدوّر على playerv5.php?match=&key= (sirtv.top) حتى لو جوه JS/متشفّر (escaped / base64)
- *  - GET /api/debug/stream?link= : بيوريك السيرفر شاف إيه في كل خطوة (للتشخيص)
- *  - GET /embed?url= : بروكسي لصفحة المشغّل بـ Referer سير تي في (احتياطي للـ iframe)
- * v4.1:
- *  - البث: لو السيرفر مقدرش يطلع رابط HLS، /api/stream بيرجّع رابط الـ iframe (مشغّل المصدر)
- *    عشان الصفحة تشغّله بدل ما المباراة متشتغلش خالص (type:'iframe' + embedUrl)
- * v4.0:
- *  - أخبار كورة: GET /api/news (عام / topics=فريق|دوري) + /api/news/status لفحص المصادر
- *    (متغير NEWS_FEEDS = JSON لإضافة مصادر RSS)
- *  - ملخصات: GET /api/highlights?q= + ملخص الماتش الرسمي من FotMob
- *    (متغير HL_CHANNELS = channel_id[:اسم],... لقنوات يوتيوب مفضلة)
- *  - GET /api/match/extras : ملخص نصي تلقائي + فيديوهات + أخبار المباراة
- *  - GET /api/player/:id : بيانات اللاعب (مركز/سن/قيمة/إحصائيات/آخر المباريات)
- *  - الهدافين: assists + ترتيب فريق اللاعب
- *  - إشعارات: متابعة دوري كامل (leagues في الاشتراك)
- * v3.9:
- *  - توقيت المباريات: تصحيح فرق الساعتين + عرض بتوقيت القاهرة
- *      (SRC_SHIFT_MIN / START_ADJUST_MIN / DISPLAY_TZ من متغيرات Railway)
- *  - ترتيب الفريق في دوريه: /api/ranks + homeRank/awayRank داخل /api/matches
- *  - متابعة الفرق: /api/teams/search , /api/team/:id (المباراة الجاية + آخر النتائج)
- *  - تفاصيل أغنى: تبديلات / كروت / أهداف لكل لاعب + دكة البدلاء + أحداث كاملة
- *  - إشعارات: مفاتيح VAPID ثابتة، تذكير قبل المباراة، بداية، جول، نهاية
- *  - /api/debug/time لفحص الوقت الخام من المصدر
  */
 const express = require('express');
 const http = require('http');
@@ -46,6 +21,7 @@ const cheerio = require('cheerio');
 const fs = require('fs');
 const path = require('path');
 const webpush = require('web-push');
+const crypto = require('crypto');
 
 const app = express();
 const server = http.createServer(app);
@@ -94,13 +70,12 @@ const io = new Server(server, { cors: { origin: true }, pingInterval: 20000, pin
 let cache = {
   matches: [], live: [], finished: [], upcoming: [],
   counts: { total: 0, live: 0, finished: 0, upcoming: 0 },
-  lastUpdate: null, error: null, version: '5.3',
+  lastUpdate: null, error: null, version: '5.4',
 };
 
 const detailsCache = new Map();
 const streamCache = new Map();
 const DETAILS_TTL = 90 * 1000;
-
 const STREAM_TTL = 45 * 1000;
 
 function to12Hour(timeStr) {
@@ -117,14 +92,12 @@ function to12Hour(timeStr) {
 }
 
 // ========== TIME (Africa/Cairo) ==========
-const VERSION = '5.3';
+const VERSION = '5.4';
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch (_) {}
 const envNum = (k, d) => { const v = process.env[k]; if (v === undefined || v === '') return d; const n = Number(v); return Number.isFinite(n) ? n : d; };
 const TZ = process.env.DISPLAY_TZ || 'Africa/Cairo';
-// الموقع المصدر بيعرض الساعة متأخرة عن توقيت القاهرة بالدقائق دي (الافتراضي ساعتين). غيّره من Railway لو لزم.
 const SRC_SHIFT_MIN = envNum('SRC_SHIFT_MIN', 120);
-// تعديل نهائي يتطبق على كل المواعيد (احتياطي، الافتراضي 0)
 const START_ADJUST_MIN = envNum('START_ADJUST_MIN', 0);
 
 const _dtf = new Intl.DateTimeFormat('en-US', {
@@ -140,7 +113,6 @@ function tzOffsetMin(ms) {
   const p = tzParts(ms);
   return (Date.UTC(p.y, p.mo - 1, p.d, p.h, p.mi, p.s) - Math.floor(ms / 1000) * 1000) / 60000;
 }
-// ساعة حائط في منطقة TZ → UTC ms
 function wallToUtc(y, mo, d, h, mi) {
   const guess = Date.UTC(y, mo - 1, d, h, mi);
   let t = guess - tzOffsetMin(guess) * 60000;
@@ -169,11 +141,6 @@ function parseClock(text) {
   if (h > 23 || mi > 59) return null;
   return { h, mi };
 }
-/**
- * يحوّل ميعاد المصدر لـ UTC صحيح.
- *  - لو data-start فيه منطقة زمنية صريحة (Z / +02:00 / epoch) نثق فيه.
- *  - لو من غير منطقة، أو لو هو نص "7:00 م" بس: نضيف SRC_SHIFT_MIN ونعتبره توقيت القاهرة.
- */
 function parseStart(attr, timeRaw, statusType) {
   const now = Date.now();
   const a = toLatinDigits(attr).trim();
@@ -205,6 +172,7 @@ function parseStart(attr, timeRaw, statusType) {
   }
   return { ms: pick, how: 'text+shift' };
 }
+
 // ========== MATCHES SCRAPER ==========
 let lastRaw = [];
 async function fetchMatches() {
@@ -220,7 +188,6 @@ async function fetchMatches() {
       let link = $el.find('a').attr('href') || null;
       if (link && !link.startsWith('http')) link = new URL(link, SOURCE).href;
 
-      // TM1 = first team in score (left number), TM2 = second (right number)
       const home = $el.find('.TM1 .TM_Name').text().trim();
       const away = $el.find('.TM2 .TM_Name').text().trim();
       const homeLogo = $el.find('.TM1 img').attr('src') || null;
@@ -266,7 +233,6 @@ async function fetchMatches() {
       const hasStream = !!(link && (link.includes('korat') || link.includes('hes-goals') || /[?&]m=\d+/.test(link) || link.includes('watch-')));
       const cardBroadcast = broadcastMetaFromHtml($el.html());
 
-      // الوقت: نصحّحه ونحوله لتوقيت القاهرة
       const st = parseStart(startAttr, timeRaw, statusType);
       const startMs = st ? st.ms + START_ADJUST_MIN * 60000 : null;
 
@@ -316,7 +282,6 @@ async function fetchMatches() {
   }
 }
 
-
 function emptyDetails() {
   return {
     events: [],
@@ -333,7 +298,7 @@ function emptyDetails() {
   };
 }
 
-// ========== NAMES: عربي ⇄ إنجليزي ==========
+// ========== NAMES ==========
 const stripMarks = s => String(s || '').normalize('NFD').replace(/[̀-ͯ]/g, '');
 function normAr(s) {
   return stripMarks(s).toLowerCase()
@@ -347,7 +312,6 @@ function normEn(s) {
   return stripMarks(s).toLowerCase().replace(/[^a-z0-9]+/g, ' ')
     .replace(/\b(fc|cf|afc|sc|fk|ac)\b/g, ' ').replace(/\s+/g, ' ').trim();
 }
-// كل سطر: عربي|إنجليزي|إنجليزي بديل...
 const DICT = `
 مانشستر سيتي|Manchester City
 مانشستر يونايتد|Manchester United
@@ -598,9 +562,9 @@ const DICT = `
 المكسيك|Mexico
 كندا|Canada`.trim().split('\n');
 
-const AR2EN = new Map();   // normAr(عربي) → [English...]
-const EN2AR = new Map();   // normEn(English) → عربي (للعرض)
-const ARS_BY_EN = new Map(); // normEn(English) → Set(كل الأسماء العربية)
+const AR2EN = new Map();
+const EN2AR = new Map();
+const ARS_BY_EN = new Map();
 for (const line of DICT) {
   const [ar, ...ens] = line.split('|').map(x => x.trim()).filter(Boolean);
   if (!ar || !ens.length) continue;
@@ -626,7 +590,6 @@ function teamEn(name) {
 }
 function normName(s) { return normAr(s); }
 function tokensOf(s) { return String(s || '').split(' ').filter(w => w.length > 2); }
-// تشابه اسم الفريق في الموقع (عربي) مع اسم FotMob (إنجليزي غالباً) — من 0 لـ 1
 function simTeam(siteName, ...fmNames) {
   const ens = enCandidates(siteName);
   const ar = normAr(siteName), ar2 = stripAl(ar);
@@ -722,11 +685,7 @@ function mapFotmobStats(periods) {
     for (const s of (g.stats || [])) {
       const arr = s.stats || [];
       if (arr.length >= 2) {
-        out.push({
-          label: s.title || s.key || '',
-          home: arr[0],
-          away: arr[1]
-        });
+        out.push({ label: s.title || s.key || '', home: arr[0], away: arr[1] });
       }
     }
   }
@@ -762,7 +721,6 @@ function mapFotmobEvents(matchFacts, idName) {
   }
   return out;
 }
-// نحدد مين دخل ومين خرج: اللي في التشكيلة الأساسية هو الخارج
 function resolveSubs(events, startersIds, subsIds) {
   for (const e of events) {
     if (e.type !== 'Substitution') continue;
@@ -784,17 +742,13 @@ function resolveSubs(events, startersIds, subsIds) {
 
 async function fotmobGet(url) {
   const { data } = await get(url, {
-    headers: {
-      'User-Agent': UA,
-      Accept: 'application/json',
-      Referer: 'https://www.fotmob.com/'
-    },
+    headers: { 'User-Agent': UA, Accept: 'application/json', Referer: 'https://www.fotmob.com/' },
     timeout: 14000
   }, 1);
   return data;
 }
 
-// ========== FOTMOB: قايمة اليوم + مطابقة المباراة ==========
+// ========== FOTMOB ==========
 const dayCache = new Map();
 const ymd = ms => { const d = new Date(ms); return `${d.getUTCFullYear()}${String(d.getUTCMonth() + 1).padStart(2, '0')}${String(d.getUTCDate()).padStart(2, '0')}`; };
 async function fotmobDay(date) {
@@ -815,8 +769,8 @@ async function fotmobDay(date) {
   return list;
 }
 
-const resolveCache = new Map(); // key → { ts, r }
-const aliasLearn = new Map();   // normAr(name) → teamId
+const resolveCache = new Map();
+const aliasLearn = new Map();
 const ALIAS_FILE = path.join(DATA_DIR, 'aliases.json');
 try {
   if (fs.existsSync(ALIAS_FILE)) for (const [k, v] of Object.entries(JSON.parse(fs.readFileSync(ALIAS_FILE, 'utf8')))) aliasLearn.set(k, v);
@@ -860,10 +814,6 @@ async function resolveFotmobMatch({ home, away, startMs }) {
   if (r.strong) { learnAlias(home, r.homeId); learnAlias(away, r.awayId); }
   return r;
 }
-async function findFotmobMatchId(home, away, startIso) {
-  const r = await resolveFotmobMatch({ home, away, startMs: startIso ? Date.parse(startIso) : null });
-  return r ? r.fmId : null;
-}
 
 let resolving = false;
 async function resolveInBackground(matches) {
@@ -887,7 +837,7 @@ async function resolveInBackground(matches) {
   } finally { resolving = false; }
 }
 
-// ========== TEAM INDEX (ids / ترتيب / مباريات) ==========
+// ========== TEAM INDEX ==========
 const INDEX_TTL = 10 * 60 * 1000;
 const teamIndex = { byId: new Map(), byEn: new Map(), byAr: new Map(), builtAt: 0, building: null };
 const teamLogo = id => `https://images.fotmob.com/image_resources/logo/teamlogo/${id}_small.png`;
@@ -1001,8 +951,7 @@ function teamSummary(t) {
   };
 }
 
-
-// ========== BROADCAST / COMMENTATOR METADATA ==========
+// ========== BROADCAST ==========
 function findDeepValue(root, keys, depth = 0, seen = new Set()) {
   if (!root || typeof root !== 'object' || depth > 7 || seen.has(root)) return null;
   seen.add(root);
@@ -1052,13 +1001,10 @@ async function enrichFromFotmob(details, home, away, startIso) {
   const rm = await resolveFotmobMatch({ home, away, startMs: startIso ? Date.parse(startIso) : null });
   const matchId = rm && rm.fmId;
   if (!matchId) return false;
-
   const data = await fotmobGet(`https://www.fotmob.com/api/data/matchDetails?matchId=${matchId}`);
   if (!data || !data.content) return false;
-
   details.source = 'fotmob';
   details.fotmobId = matchId;
-
   const content = data.content;
   const broadcastMeta = broadcastMetaFromData(data);
   details.broadcast = { ...broadcastMeta, source: (broadcastMeta.channel || broadcastMeta.commentator) ? 'fotmob' : null };
@@ -1066,25 +1012,17 @@ async function enrichFromFotmob(details, home, away, startIso) {
   const stadium = infoBox.Stadium || {};
   const referee = infoBox.Referee || {};
   const tournament = infoBox.Tournament || {};
-
   details.info = {
     competition: tournament.leagueName || (data.general && data.general.leagueName) || null,
     round: tournament.roundName || tournament.round || null,
-    stadium: stadium.name || null,
-    city: stadium.city || null,
-    country: stadium.country || null,
-    capacity: stadium.capacity || null,
-    attendance: infoBox.Attendance || null,
-    referee: referee.text || referee.name || null,
-    refereeCountry: referee.country || null,
+    stadium: stadium.name || null, city: stadium.city || null, country: stadium.country || null,
+    capacity: stadium.capacity || null, attendance: infoBox.Attendance || null,
+    referee: referee.text || referee.name || null, refereeCountry: referee.country || null,
     date: (infoBox['Match Date'] && infoBox['Match Date'].utcTime) || (data.general && data.general.matchTimeUTC) || null,
-    home: data.header?.teams?.[0]?.name || home,
-    away: data.header?.teams?.[1]?.name || away,
-    homeScore: data.header?.teams?.[0]?.score,
-    awayScore: data.header?.teams?.[1]?.score,
+    home: data.header?.teams?.[0]?.name || home, away: data.header?.teams?.[1]?.name || away,
+    homeScore: data.header?.teams?.[0]?.score, awayScore: data.header?.teams?.[1]?.score,
     status: data.header?.status?.reason?.long || (data.general?.finished ? 'Full-Time' : null)
   };
-
   const lu = content.lineup || {};
   const ht = lu.homeTeam || {};
   const at = lu.awayTeam || {};
@@ -1093,20 +1031,13 @@ async function enrichFromFotmob(details, home, away, startIso) {
   details.homeSubs = mapFotmobPlayers(ht.subs);
   details.awaySubs = mapFotmobPlayers(at.subs);
   details.formations = {
-    home: ht.formation || null,
-    away: at.formation || null,
-    homeCoach: ht.coach?.name || null,
-    awayCoach: at.coach?.name || null,
+    home: ht.formation || null, away: at.formation || null,
+    homeCoach: ht.coach?.name || null, awayCoach: at.coach?.name || null,
     homeCoachPhoto: ht.coach?.id ? fotmobPhoto(ht.coach.id) : null,
-    awayCoachPhoto: at.coach?.id ? fotmobPhoto(at.coach.id) : null,
-    confirmed: true
+    awayCoachPhoto: at.coach?.id ? fotmobPhoto(at.coach.id) : null, confirmed: true
   };
-
   details.stats = mapFotmobStats(content.stats?.Periods);
-  { const hl = content.matchFacts && content.matchFacts.highlights;
-    if (hl && (hl.url || hl.image)) details.highlight = { url: hl.url || null, image: hl.image || null, source: hl.source || null }; }
-
-  // ---- الأحداث الكاملة (أهداف / كروت / تبديلات / VAR) ----
+  { const hl = content.matchFacts && content.matchFacts.highlights; if (hl && (hl.url || hl.image)) details.highlight = { url: hl.url || null, image: hl.image || null, source: hl.source || null }; }
   const all = [...details.homeLineup, ...details.awayLineup, ...details.homeSubs, ...details.awaySubs];
   const byId = new Map(all.map(p => [p.id, p]));
   const idName = new Map(all.map(p => [p.id, p.name]));
@@ -1114,53 +1045,24 @@ async function enrichFromFotmob(details, home, away, startIso) {
   const subsIds = new Set([...details.homeSubs, ...details.awaySubs].map(p => p.id));
   let events = mapFotmobEvents(content.matchFacts, idName);
   resolveSubs(events, startersIds, subsIds);
-
   if (!events.length) {
     const headerEv = data.header?.events || {};
-    for (const side of ['homeTeamGoals', 'awayTeamGoals']) {
-      for (const [playerName, arr] of Object.entries(headerEv[side] || {})) {
-        for (const g of arr || []) {
-          events.push({
-            minute: g.time != null ? String(g.time) : null, type: g.type || 'Goal',
-            player: g.player?.name || playerName, team: side.startsWith('home') ? 'home' : 'away',
-            detail: g.assistStr || '', text: g.player?.name || playerName
-          });
-        }
-      }
-    }
-    for (const side of ['homeTeamRedCards', 'awayTeamRedCards']) {
-      for (const [playerName, arr] of Object.entries(headerEv[side] || {})) {
-        for (const c of arr || []) {
-          events.push({ minute: c.time != null ? String(c.time) : null, type: 'Red card', player: playerName, team: side.startsWith('home') ? 'home' : 'away', text: playerName });
-        }
-      }
-    }
+    for (const side of ['homeTeamGoals', 'awayTeamGoals']) for (const [playerName, arr] of Object.entries(headerEv[side] || {})) for (const g of arr || []) events.push({ minute: g.time != null ? String(g.time) : null, type: g.type || 'Goal', player: g.player?.name || playerName, team: side.startsWith('home') ? 'home' : 'away', detail: g.assistStr || '', text: g.player?.name || playerName });
+    for (const side of ['homeTeamRedCards', 'awayTeamRedCards']) for (const [playerName, arr] of Object.entries(headerEv[side] || {})) for (const c of arr || []) events.push({ minute: c.time != null ? String(c.time) : null, type: 'Red card', player: playerName, team: side.startsWith('home') ? 'home' : 'away', text: playerName });
   }
   events.forEach((e, i) => { e.n = i; });
-
-  // ---- نطبّق الأحداث على اللاعبين (تبديل/أهداف/كروت) لو لسه مفيش من performance ----
   const mnum = x => { const n = parseInt(x, 10); return Number.isFinite(n) ? n : null; };
   const cnt = { g: new Map(), og: new Map(), y: new Map(), r: new Map(), a: new Map() };
   const inc = (m, id) => { if (id != null) m.set(id, (m.get(id) || 0) + 1); };
   for (const e of events) {
-    if (e.type === 'Substitution') {
-      const pi = byId.get(e.playerInId), po = byId.get(e.playerOutId);
-      if (pi && pi.subIn == null) pi.subIn = mnum(e.minute);
-      if (po && po.subOut == null) po.subOut = mnum(e.minute);
-    } else if (e.type === 'Goal') inc(cnt.g, e.playerId);
+    if (e.type === 'Substitution') { const pi = byId.get(e.playerInId), po = byId.get(e.playerOutId); if (pi && pi.subIn == null) pi.subIn = mnum(e.minute); if (po && po.subOut == null) po.subOut = mnum(e.minute); }
+    else if (e.type === 'Goal') inc(cnt.g, e.playerId);
     else if (e.type === 'Own goal') inc(cnt.og, e.playerId);
     else if (e.type === 'Yellow card') inc(cnt.y, e.playerId);
     else if (e.type === 'Red card') inc(cnt.r, e.playerId);
   }
-  for (const p of all) {
-    p.goals = Math.max(p.goals || 0, cnt.g.get(p.id) || 0);
-    p.ownGoals = Math.max(p.ownGoals || 0, cnt.og.get(p.id) || 0);
-    p.yellow = Math.max(p.yellow || 0, cnt.y.get(p.id) || 0);
-    p.red = Math.max(p.red || 0, cnt.r.get(p.id) || 0);
-  }
+  for (const p of all) { p.goals = Math.max(p.goals || 0, cnt.g.get(p.id) || 0); p.ownGoals = Math.max(p.ownGoals || 0, cnt.og.get(p.id) || 0); p.yellow = Math.max(p.yellow || 0, cnt.y.get(p.id) || 0); p.red = Math.max(p.red || 0, cnt.r.get(p.id) || 0); }
   details.events = events;
-
-  // ---- ترتيب الفريقين ----
   const hid = rm.homeId, aid = rm.awayId;
   if (rm.swapped) swapDetails(details);
   details.ids = { home: hid || null, away: aid || null };
@@ -1168,7 +1070,6 @@ async function enrichFromFotmob(details, home, away, startIso) {
   return true;
 }
 
-// لو الموقع عارض الفريقين بترتيب عكس FotMob نقلب الجهات عشان تطابق كروت الموقع
 function swapDetails(d) {
   [d.homeLineup, d.awayLineup] = [d.awayLineup, d.homeLineup];
   [d.homeSubs, d.awaySubs] = [d.awaySubs, d.homeSubs];
@@ -1180,7 +1081,6 @@ function swapDetails(d) {
   d.info = { ...i, home: i.away, away: i.home, homeScore: i.awayScore, awayScore: i.homeScore };
 }
 
-// keep sportscore as weak fallback for lineups only
 async function enrichFromSportScore(details, home, away) {
   try {
     const h = teamEn(home).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
@@ -1188,42 +1088,15 @@ async function enrichFromSportScore(details, home, away) {
     const slugs = [`${h}-vs-${a}`, `${a}-vs-${h}`, `fc-${h}-vs-${a}`, `${h}-vs-fc-${a}`];
     for (const slug of [...new Set(slugs)]) {
       try {
-        const { data } = await get(
-          `https://sportscore.com/api/widget/match/?sport=football&slug=${encodeURIComponent(slug)}`,
-          { headers: { Accept: 'application/json' }, timeout: 9000 },
-          0
-        );
+        const { data } = await get(`https://sportscore.com/api/widget/match/?sport=football&slug=${encodeURIComponent(slug)}`, { headers: { Accept: 'application/json' }, timeout: 9000 }, 0);
         const match = data && data.match;
         if (!match) continue;
         if (!details.source) details.source = 'sportscore';
-        if (!details.events.length && match.incidents) {
-          details.events = (match.incidents || []).map(e => ({
-            minute: e.time != null ? String(e.time) : null,
-            type: e.type || '',
-            player: e.player || e.player_in || '',
-            team: e.side === 'home' ? 'home' : e.side === 'away' ? 'away' : '',
-            text: e.player || [e.player_in, e.player_out].filter(Boolean).join(' ← ') || e.type
-          }));
-        }
+        if (!details.events.length && match.incidents) details.events = (match.incidents || []).map(e => ({ minute: e.time != null ? String(e.time) : null, type: e.type || '', player: e.player || e.player_in || '', team: e.side === 'home' ? 'home' : e.side === 'away' ? 'away' : '', text: e.player || [e.player_in, e.player_out].filter(Boolean).join(' ← ') || e.type }));
         const lu = match.lineups || {};
-        if (!details.homeLineup.length && lu.home_xi) {
-          details.homeLineup = (lu.home_xi || []).map(p => ({
-            name: p.name, number: p.number, position: p.position, rating: p.rating,
-            captain: !!p.captain, photo: null
-          }));
-        }
-        if (!details.awayLineup.length && lu.away_xi) {
-          details.awayLineup = (lu.away_xi || []).map(p => ({
-            name: p.name, number: p.number, position: p.position, rating: p.rating,
-            captain: !!p.captain, photo: null
-          }));
-        }
-        if (!details.formations.home && lu.home_formation) {
-          details.formations = {
-            home: lu.home_formation, away: lu.away_formation,
-            homeCoach: lu.home_coach, awayCoach: lu.away_coach, confirmed: !!lu.confirmed
-          };
-        }
+        if (!details.homeLineup.length && lu.home_xi) details.homeLineup = (lu.home_xi || []).map(p => ({ name: p.name, number: p.number, position: p.position, rating: p.rating, captain: !!p.captain, photo: null }));
+        if (!details.awayLineup.length && lu.away_xi) details.awayLineup = (lu.away_xi || []).map(p => ({ name: p.name, number: p.number, position: p.position, rating: p.rating, captain: !!p.captain, photo: null }));
+        if (!details.formations.home && lu.home_formation) details.formations = { home: lu.home_formation, away: lu.away_formation, homeCoach: lu.home_coach, awayCoach: lu.away_coach, confirmed: !!lu.confirmed };
         return true;
       } catch (_) {}
     }
@@ -1235,12 +1108,7 @@ async function trySirTvPage(url, details) {
   try {
     const { data } = await get(url, { headers: { Referer: SOURCE } }, 0);
     const meta = broadcastMetaFromHtml(data);
-    details.broadcast = {
-      channel: details.broadcast?.channel || meta.channel || null,
-      commentator: details.broadcast?.commentator || meta.commentator || null,
-      commentatorPhoto: details.broadcast?.commentatorPhoto || meta.commentatorPhoto || null,
-      source: (details.broadcast?.channel || details.broadcast?.commentator || meta.channel || meta.commentator) ? 'sir-tv' : null
-    };
+    details.broadcast = { channel: details.broadcast?.channel || meta.channel || null, commentator: details.broadcast?.commentator || meta.commentator || null, commentatorPhoto: details.broadcast?.commentatorPhoto || meta.commentatorPhoto || null, source: (details.broadcast?.channel || details.broadcast?.commentator || meta.channel || meta.commentator) ? 'sir-tv' : null };
     if (!details.source) details.source = 'sir-tv';
   } catch (_) {}
 }
@@ -1248,43 +1116,19 @@ async function trySirTvPage(url, details) {
 async function fetchMatchDetails(matchLink, externalId, home, away) {
   let startIso = null;
   if ((!home || !away) && (matchLink || externalId)) {
-    const m = cache.matches.find(x =>
-      (externalId && (x.externalId === externalId || x.id === externalId)) ||
-      (matchLink && x.link === matchLink)
-    );
-    if (m) {
-      home = home || m.home;
-      away = away || m.away;
-      matchLink = matchLink || m.link;
-      startIso = m.start || null;
-    }
+    const m = cache.matches.find(x => (externalId && (x.externalId === externalId || x.id === externalId)) || (matchLink && x.link === matchLink));
+    if (m) { home = home || m.home; away = away || m.away; matchLink = matchLink || m.link; startIso = m.start || null; }
   } else if (home && away) {
     const m = cache.matches.find(x => x.home === home && x.away === away);
     if (m) startIso = m.start || null;
   }
-
   const key = String(externalId || matchLink || `${home}-${away}`);
   const hit = detailsCache.get(key);
   if (hit && Date.now() - hit.ts < DETAILS_TTL) return hit.data;
-
   const details = emptyDetails();
-
-  if (home && away) {
-    try {
-      await enrichFromFotmob(details, home, away, startIso);
-    } catch (e) {
-      console.error('[FotMob]', e.message);
-    }
-  }
-
-  // fallback
-  if (!details.homeLineup.length && home && away) {
-    await enrichFromSportScore(details, home, away);
-  }
-  if (matchLink && /sir-tv\.vip/i.test(matchLink)) {
-    await trySirTvPage(matchLink, details);
-  }
-
+  if (home && away) { try { await enrichFromFotmob(details, home, away, startIso); } catch (e) { console.error('[FotMob]', e.message); } }
+  if (!details.homeLineup.length && home && away) await enrichFromSportScore(details, home, away);
+  if (matchLink && /sir-tv\.vip/i.test(matchLink)) await trySirTvPage(matchLink, details);
   details.updatedAt = new Date().toISOString();
   detailsCache.set(key, { ts: Date.now(), data: details });
   return details;
@@ -1295,42 +1139,28 @@ async function resolveStream(matchLink, ctx = {}) {
   if (!matchLink) throw new Error('No link provided');
   const hit = streamCache.get(matchLink);
   if (hit && Date.now() - hit.ts < STREAM_TTL) return hit.data;
-
   const headers = { 'User-Agent': UA, 'Accept-Language': 'ar,en;q=0.9', Referer: 'https://sir-tv.vip/' };
-
   const page1 = await get(matchLink, { headers }, 1);
   let playerUrl = extractPlayerUrl(page1.data, matchLink);
-  if (!playerUrl) {
-    const mid = matchLink.match(/[?&]m=(\d+)/);
-    if (mid) playerUrl = `https://n1.sirftv.com/hard/player.html?match=${mid[1]}`;
-  } else ctx.embed = playerUrl;
+  if (!playerUrl) { const mid = matchLink.match(/[?&]m=(\d+)/); if (mid) playerUrl = `https://n1.sirftv.com/hard/player.html?match=${mid[1]}`; }
+  else ctx.embed = playerUrl;
   if (!playerUrl) throw new Error('Player page not found');
-
   const page2 = await get(playerUrl, { headers: { ...headers, Referer: matchLink } }, 1);
   let streams = extractStreams(page2.data);
-  if (streams.length) {
-    const result = buildResult(streams, playerUrl);
-    result.embed = ctx.embed;
-    streamCache.set(matchLink, { ts: Date.now(), data: result });
-    return result;
-  }
-
+  if (streams.length) { const result = buildResult(streams, playerUrl); result.embed = ctx.embed; streamCache.set(matchLink, { ts: Date.now(), data: result }); return result; }
   let finalPlayer = extractFinalPlayer(page2.data, playerUrl);
   if (!finalPlayer) throw new Error('Final player not found');
   if (!finalPlayer.startsWith('http')) finalPlayer = new URL(finalPlayer, playerUrl).href;
   ctx.embed = finalPlayer;
-
   const page3 = await get(finalPlayer, { headers: { ...headers, Referer: playerUrl } }, 1);
   streams = extractStreams(page3.data);
   if (!streams.length) throw new Error('No stream URL found');
-
   const result = buildResult(streams, finalPlayer);
   result.embed = ctx.embed;
   streamCache.set(matchLink, { ts: Date.now(), data: result });
   return result;
 }
 
-// يفك الـ escape والـ base64 عشان الروابط المخبية جوه JS تتلاقي
 function normHtml(html) {
   let h = String(html || '');
   h = h.replace(/\\u002F/gi, '/').replace(/\\\//g, '/').replace(/&amp;/g, '&');
@@ -1344,13 +1174,11 @@ const PLAYER_RX = /https?:\/\/[^"'\s<>\\]*(?:sirtv\.top|sirftv\.com)[^"'\s<>\\]*
 function extractPlayerUrl(html, base) {
   const n = normHtml(html);
   const $ = cheerio.load(n);
-  const iframe = $('iframe#player, iframe[src*="sirtv"], iframe[src*="sirftv"], iframe[src*="playerv"], iframe[src*="player"], iframe').first().attr('src')
-    || $('iframe[data-src]').first().attr('data-src');
+  const iframe = $('iframe#player, iframe[src*="sirtv"], iframe[src*="sirftv"], iframe[src*="playerv"], iframe[src*="player"], iframe').first().attr('src') || $('iframe[data-src]').first().attr('data-src');
   if (iframe && !/^about:|^javascript:/i.test(iframe)) return iframe.startsWith('http') ? iframe : new URL(iframe, base).href;
   const m = n.match(PLAYER_RX) || n.match(/https?:\/\/[^"'\s<>]+player\w*\.php\?[^"'\s<>]+/i);
   return m ? m[0] : null;
 }
-
 function extractFinalPlayer(html, base) {
   const $ = cheerio.load(html);
   let src = $('iframe').first().attr('src');
@@ -1358,7 +1186,6 @@ function extractFinalPlayer(html, base) {
   const m = html.match(/https?:\/\/[^"'\s]+playerv5\.php[^"'\s]*/i);
   return m ? m[0] : null;
 }
-
 function extractStreams(html) {
   html = normHtml(html);
   const set = new Set();
@@ -1370,7 +1197,6 @@ function extractStreams(html) {
   for (const re of patterns) (html.match(re) || []).forEach(u => set.add(u.replace(/\\$/, '')));
   return [...set];
 }
-
 function buildResult(streams, referer) {
   const hd = streams.find(s => /_hd|\/hd|1080|720|high/i.test(s));
   const sd = streams.find(s => !/_hd|\/hd|1080|720|high/i.test(s)) || streams[0];
@@ -1382,81 +1208,109 @@ function buildResult(streams, referer) {
   return { streamUrl: chosen, qualities, quality: hd ? 'HD' : 'SD', type: 'hls', referer, resolvedAt: new Date().toISOString() };
 }
 
+// ========== Syria Player ==========
+const SYRIA_HOST_RX = /(^|\.)syria-player\.info$/i;
+const SYRIA_S3_HOST = '1sisi.s3.us-east-2.amazonaws.com';
+function isSyriaUrl(u) { try { return SYRIA_HOST_RX.test(new URL(u).hostname); } catch { return false; } }
+function syriaTarget(u) {
+  const url = new URL(u);
+  const p = url.pathname.replace(/\/+$/, '');
+  const pathOnly = p.endsWith('.m3u8') ? p : p + '/master.m3u8';
+  return { origin: url.origin, base: `https://${SYRIA_S3_HOST}`, path: p, masterUrl: `https://${SYRIA_S3_HOST}${pathOnly}` };
+}
+function syriaHeaders(origin) {
+  return {
+    'User-Agent': 'Mozilla/5.0 (Linux; Android 15; CPH2591 Build/AP3A.240617.008) AppleWebKit/537.36 (KHTML, like Gecko) Jrryilw/4.0 Chrome/155.0.8059.43 Mobile Safari/537.36',
+    'sec-ch-ua-platform': '"Android"',
+    'sec-ch-ua': '"Android WebView";v="155", "Chromium";v="155", "Not(A:Brand";v="24"',
+    'sec-ch-ua-mobile': '?1',
+    'Accept': '*/*',
+    'Origin': origin,
+    'X-Requested-With': 'com.mycompany.app.soulbrowser',
+    'Sec-Fetch-Site': 'cross-site',
+    'Sec-Fetch-Mode': 'cors',
+    'Sec-Fetch-Dest': 'empty',
+    'Referer': origin + '/',
+    'Accept-Encoding': 'identity',
+    'Accept-Language': 'ar-EG,ar;q=0.9,en-EG;q=0.8,en-US;q=0.7,en;q=0.6'
+  };
+}
+
+// هيدرز ثابتة
+const STREAM_DEFAULTS = {
+  referer: process.env.STREAM_REFERER || 'https://2.shootsimo.net/',
+  origin: process.env.STREAM_ORIGIN || 'https://2.shootsimo.net',
+  ua: process.env.STREAM_UA || 'Mozilla/5.0 (Linux; Android 15; CPH2591 Build/AP3A.240617.008) AppleWebKit/537.36 (KHTML, like Gecko) Jrryilw/4.0 Chrome/155.0.8059.43 Mobile Safari/537.36',
+  accept: process.env.STREAM_ACCEPT || 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.9',
+  cookie: process.env.STREAM_COOKIE || 'twk_idm_key=oTP2PN1sVaXKX64FXRcDv; TawkConnectionTime=0; twk_uuid_6a5199a020e17a1d43af9db4=%7B%22uuid%22%3A%221.1vXroIhhviNS0LXiqv0qN8nqMJ9WdftZvPq5nXlFzrhY2OC9M7aKn3D47MmK57GENy0huIqWXXJwnD3vmeAgxfuGPVINoWvxbuZ0GVvkPCGfbcGfOkEjfg2%22%2C%22version%22%3A3%2C%22domain%22%3A%22shootsimo.net%22%2C%22ts%22%3A1793134147168%7D'
+};
+function streamHeaders(e) {
+  e = e || {};
+  const ref = e.referer || (e.origin ? e.origin + '/' : STREAM_DEFAULTS.referer);
+  let origin = e.origin;
+  if (!origin) { try { origin = new URL(ref).origin; } catch (_) { origin = STREAM_DEFAULTS.origin; } }
+  const h = { Origin: origin, Accept: e.accept || STREAM_DEFAULTS.accept, 'Accept-Encoding': 'identity', 'User-Agent': e.ua || STREAM_DEFAULTS.ua, Referer: ref, Connection: 'keep-alive' };
+  const ck = e.cookie || STREAM_DEFAULTS.cookie;
+  if (ck) h.Cookie = ck;
+  return h;
+}
+
 async function proxyHls(req, res, targetUrl, referer) {
   try {
+    const targetHost = (() => { try { return new URL(targetUrl).hostname.toLowerCase(); } catch { return ''; } })();
+    const isSyria = req.query.syr === '1' || targetHost === SYRIA_S3_HOST.toLowerCase();
     const mk = req.query.k ? manualStreams.get(String(req.query.k)) : null;
-    const targetHost = new URL(targetUrl).hostname.toLowerCase();
 
-    // استخدم هيدرز مصدر Shootsimo نفسها لكل من playlist وملفات TS.
-    // مهم: الطلبات الفرعية للـ HLS تمر من /proxy أيضاً، لذلك يجب أن تستخدم
-    // نفس Origin / Referer / Cookie / User-Agent، وليس هيدرز SirTV الافتراضية.
-    const isShootsimo = targetHost === 'shootsimo.net' ||
-      targetHost.endsWith('.shootsimo.net');
-    const requestHeaders = mk
-      ? streamHeaders(mk)
-      : isShootsimo
-        ? streamHeaders({
-            referer: process.env.STREAM_REFERER || 'https://2.shootsimo.net/',
-            origin: process.env.STREAM_ORIGIN || 'https://2.shootsimo.net',
-            ua: process.env.STREAM_UA,
-            accept: process.env.STREAM_ACCEPT,
-            cookie: process.env.STREAM_COOKIE
-          })
-        : {
-            'User-Agent': UA,
-            Accept: '*/*',
-            Origin: 'https://912acsss8af382.sirtv.top',
-            Referer: referer || 'https://912acsss8af382.sirtv.top/',
-            'Accept-Encoding': 'identity',
-            Connection: 'keep-alive'
-          };
-
-    // Brightcove HLS uses a master playlist, child playlists, and fragmented MP4
-    // media/init segments. Preserve byte-range requests for those media files.
-    if (req.headers.range) requestHeaders.Range = req.headers.range;
-    requestHeaders['Accept-Encoding'] = 'identity';
+    let requestHeaders;
+    if (isSyria) {
+      requestHeaders = syriaHeaders('https://1cdn.syria-player.info');
+      if (req.headers.range) requestHeaders.Range = req.headers.range;
+    } else {
+      const isShootsimo = targetHost === 'shootsimo.net' || targetHost.endsWith('.shootsimo.net');
+      requestHeaders = mk
+        ? streamHeaders(mk)
+        : isShootsimo
+          ? streamHeaders({ referer: process.env.STREAM_REFERER || 'https://2.shootsimo.net/', origin: process.env.STREAM_ORIGIN || 'https://2.shootsimo.net', ua: process.env.STREAM_UA, accept: process.env.STREAM_ACCEPT, cookie: process.env.STREAM_COOKIE })
+          : { 'User-Agent': UA, Accept: '*/*', Origin: 'https://912acsss8af382.sirtv.top', Referer: referer || 'https://912acsss8af382.sirtv.top/', 'Accept-Encoding': 'identity', Connection: 'keep-alive' };
+      if (req.headers.range) requestHeaders.Range = req.headers.range;
+      requestHeaders['Accept-Encoding'] = 'identity';
+    }
 
     const response = await axios.get(targetUrl, {
-      headers: requestHeaders,
-      responseType: 'arraybuffer',
-      timeout: 30000,
-      maxRedirects: 5,
-      validateStatus: () => true
+      headers: requestHeaders, responseType: 'arraybuffer',
+      timeout: 30000, maxRedirects: 5, validateStatus: () => true
     });
     if (response.status >= 400) return res.status(response.status).send('Upstream error ' + response.status);
 
     const ct = (response.headers['content-type'] || '').toLowerCase();
-    const isPlaylist = ct.includes('mpegurl') || ct.includes('m3u8') || /\.m3u8($|\?)/i.test(targetUrl) || /_sc|_hd|_sd/i.test(targetUrl);
+    const isPlaylist = ct.includes('mpegurl') || ct.includes('m3u8') || /\.m3u8($|\?)/i.test(targetUrl);
 
-    res.set({
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Headers': '*',
-      'Cache-Control': 'no-cache, no-store'
-    });
+    res.set({ 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': '*', 'Cache-Control': 'no-cache, no-store' });
 
     if (isPlaylist) {
       let body = Buffer.from(response.data).toString('utf8');
       const base = new URL(targetUrl);
       const host = `${req.protocol}://${req.get('host')}`;
       const proxyBase = `${host}/proxy?url=`;
-      const refQ = (mk ? `&k=${encodeURIComponent(String(req.query.k))}` : '') + (referer ? `&ref=${encodeURIComponent(referer)}` : '');
-      body = body.replace(/(https?:\/\/[^\s\n\r"']+)/g, m => proxyBase + encodeURIComponent(m) + refQ);
-      // Rewrite relative HLS references, including Brightcove .mp4 media and
-      // initialization segments (not just .ts/.m4s). Keep optional query strings.
+      const extraQ = (req.query.k ? `&k=${encodeURIComponent(String(req.query.k))}` : '') + (referer ? `&ref=${encodeURIComponent(referer)}` : '') + (isSyria ? `&syr=1` : '');
+
+      body = body.replace(/(https?:\/\/[^\s\n\r"']+)/g, m => proxyBase + encodeURIComponent(m) + extraQ);
+
       body = body.replace(/^([^#\s][^\r\n]*\.(?:ts|m4s|mp4|aac|key|m3u8)(?:\?[^\s]*)?)$/gmi, m => {
-        try {
-          const trimmed = m.trim();
-          if (/^https?:\/\//i.test(trimmed)) return proxyBase + encodeURIComponent(trimmed) + refQ;
-          return proxyBase + encodeURIComponent(new URL(trimmed, base).href) + refQ;
-        } catch { return m; }
+        const trimmed = m.trim();
+        if (/^https?:\/\//i.test(trimmed)) return proxyBase + encodeURIComponent(trimmed) + extraQ;
+        try { return proxyBase + encodeURIComponent(new URL(trimmed, base).href) + extraQ; } catch { return m; }
       });
-      body = body.replace(/URI="([^"]+)"/g, (m0, u) => { if (u.startsWith(proxyBase)) return m0; try { return 'URI="' + proxyBase + encodeURIComponent(new URL(u, base).href) + refQ + '"'; } catch { return m0; } });
+
+      body = body.replace(/URI="([^"]+)"/g, (m0, u) => {
+        if (u.startsWith(proxyBase)) return m0;
+        try { return 'URI="' + proxyBase + encodeURIComponent(new URL(u, base).href) + extraQ + '"'; } catch { return m0; }
+      });
+
       res.set('Content-Type', 'application/vnd.apple.mpegurl');
       return res.send(body);
     }
 
-    // Preserve upstream status and range metadata. Brightcove's media segments
-    // may respond with 206 Partial Content; returning them as 200 breaks playback.
     res.status(response.status);
     res.set('Content-Type', ct || 'application/octet-stream');
     for (const h of ['content-length', 'content-range', 'accept-ranges', 'last-modified', 'etag']) {
@@ -1469,8 +1323,7 @@ async function proxyHls(req, res, targetUrl, referer) {
   }
 }
 
-
-// ========== LEAGUES (FotMob) ==========
+// ========== LEAGUES ==========
 const leagueCache = new Map();
 const LEAGUE_TTL = 5 * 60 * 1000;
 const leagueBad = new Set();
@@ -1495,20 +1348,11 @@ const LEAGUES = [
 function mapTableRows(rows) {
   if (!Array.isArray(rows)) return [];
   return rows.map(r => ({
-    rank: r.idx ?? r.rank ?? null,
-    id: r.id,
-    name: r.name,
-    shortName: r.shortName || r.name,
-    played: r.played,
-    wins: r.wins,
-    draws: r.draws,
-    losses: r.losses,
+    rank: r.idx ?? r.rank ?? null, id: r.id, name: r.name, shortName: r.shortName || r.name,
+    played: r.played, wins: r.wins, draws: r.draws, losses: r.losses,
     goalsFor: r.scoresStr ? Number(String(r.scoresStr).split('-')[0]) : null,
     goalsAgainst: r.scoresStr ? Number(String(r.scoresStr).split('-')[1]) : null,
-    goalsStr: r.scoresStr || null,
-    goalDiff: r.goalConDiff ?? null,
-    pts: r.pts,
-    qualColor: r.qualColor || null,
+    goalsStr: r.scoresStr || null, goalDiff: r.goalConDiff ?? null, pts: r.pts, qualColor: r.qualColor || null,
     logo: r.id ? `https://images.fotmob.com/image_resources/logo/teamlogo/${r.id}_small.png` : null
   }));
 }
@@ -1521,19 +1365,13 @@ function mapFixtures(list) {
     if (st.finished) statusType = 'finished';
     else if (st.started && !st.finished) statusType = 'live';
     return {
-      id: m.id,
-      round: m.roundName || m.round || null,
-      home: m.home?.name || m.home?.shortName,
-      away: m.away?.name || m.away?.shortName,
-      homeId: m.home?.id,
-      awayId: m.away?.id,
+      id: m.id, round: m.roundName || m.round || null,
+      home: m.home?.name || m.home?.shortName, away: m.away?.name || m.away?.shortName,
+      homeId: m.home?.id, awayId: m.away?.id,
       homeLogo: m.home?.id ? `https://images.fotmob.com/image_resources/logo/teamlogo/${m.home.id}_small.png` : null,
       awayLogo: m.away?.id ? `https://images.fotmob.com/image_resources/logo/teamlogo/${m.away.id}_small.png` : null,
-      score: st.scoreStr || null,
-      status: st.reason?.long || (st.finished ? 'انتهت' : st.started ? 'مباشر' : 'لم تبدأ'),
-      statusType,
-      utcTime: st.utcTime || null,
-      pageUrl: m.pageUrl || null
+      score: st.scoreStr || null, status: st.reason?.long || (st.finished ? 'انتهت' : st.started ? 'مباشر' : 'لم تبدأ'),
+      statusType, utcTime: st.utcTime || null, pageUrl: m.pageUrl || null
     };
   });
 }
@@ -1550,11 +1388,8 @@ function mapScorers(playersStats) {
     if (!id || seen.has(id)) return;
     seen.add(id);
     list.push({
-      id,
-      rank: p.rank ?? p.Rank ?? list.length + 1,
-      name: p.name || p.ParticipantName,
-      teamId: p.teamId || p.TeamId,
-      teamName: p.teamName || p.TeamName,
+      id, rank: p.rank ?? p.Rank ?? list.length + 1,
+      name: p.name || p.ParticipantName, teamId: p.teamId || p.TeamId, teamName: p.teamName || p.TeamName,
       goals: p.value ?? p.StatValue ?? p.stat?.value ?? null,
       photo: fotmobPhoto(id),
       teamLogo: (p.teamId || p.TeamId) ? `https://images.fotmob.com/image_resources/logo/teamlogo/${p.teamId || p.TeamId}_small.png` : null
@@ -1569,206 +1404,115 @@ async function fetchFullScorers(fetchAllUrl) {
   if (!fetchAllUrl) return [];
   try {
     const { data } = await axios.get(fetchAllUrl, {
-      headers: {
-        'User-Agent': UA,
-        Accept: 'application/json,text/plain,*/*',
-        'Accept-Encoding': 'gzip, deflate',
-        Referer: 'https://www.fotmob.com/'
-      },
-      timeout: 14000,
-      decompress: true,
-      validateStatus: s => s < 500
+      headers: { 'User-Agent': UA, Accept: 'application/json,text/plain,*/*', 'Accept-Encoding': 'gzip, deflate', Referer: 'https://www.fotmob.com/' },
+      timeout: 14000, decompress: true, validateStatus: s => s < 500
     });
-
     let list = [];
-    if (Array.isArray(data)) {
-      list = data;
-    } else if (data && Array.isArray(data.TopLists) && data.TopLists[0]) {
-      list = data.TopLists[0].StatList || [];
-    } else if (data && Array.isArray(data.statsList)) {
-      list = data.statsList;
-    } else if (data && Array.isArray(data.players)) {
-      list = data.players;
-    }
-
+    if (Array.isArray(data)) list = data;
+    else if (data && Array.isArray(data.TopLists) && data.TopLists[0]) list = data.TopLists[0].StatList || [];
+    else if (data && Array.isArray(data.statsList)) list = data.statsList;
+    else if (data && Array.isArray(data.players)) list = data.players;
     return (list || []).slice(0, 30).map((p, i) => {
       const id = p.ParticiantId || p.ParticipantId || p.id || p.playerId;
       const teamId = p.TeamId || p.teamId;
       return {
-        id,
-        rank: p.Rank ?? p.rank ?? i + 1,
+        id, rank: p.Rank ?? p.rank ?? i + 1,
         name: p.ParticipantName || p.ParticiantName || p.name || p.playerName,
-        teamId,
-        teamName: p.TeamName || p.teamName,
+        teamId, teamName: p.TeamName || p.teamName,
         goals: p.StatValue ?? p.value ?? p.stat?.value ?? null,
         photo: fotmobPhoto(id),
         teamLogo: teamId ? `https://images.fotmob.com/image_resources/logo/teamlogo/${teamId}_small.png` : null
       };
     }).filter(p => p.name);
-  } catch (e) {
-    console.error('[Scorers full]', e.message);
-    return [];
-  }
+  } catch (e) { console.error('[Scorers full]', e.message); return []; }
 }
 
 async function fetchLeagueDetails(leagueId) {
   const id = Number(leagueId);
   const hit = leagueCache.get(id);
   if (hit && Date.now() - hit.ts < LEAGUE_TTL) return hit.data;
-
-  // Prefer latest season (e.g. Egypt 2026/2027)
   let data = await fotmobGet(`https://www.fotmob.com/api/data/leagues?id=${id}`);
   if (!data || !data.details) throw new Error('League not found');
   const seasons = data.allAvailableSeasons || [];
   const latest = seasons[0] || data.details.selectedSeason;
   if (latest && data.details.selectedSeason !== latest) {
-    try {
-      const dLatest = await fotmobGet(`https://www.fotmob.com/api/data/leagues?id=${id}&season=${encodeURIComponent(latest)}`);
-      if (dLatest && dLatest.details) data = dLatest;
-    } catch (_) {}
+    try { const dLatest = await fotmobGet(`https://www.fotmob.com/api/data/leagues?id=${id}&season=${encodeURIComponent(latest)}`); if (dLatest && dLatest.details) data = dLatest; } catch (_) {}
   }
-
-  const hasTable = (d) => {
-    if (Array.isArray(d?.table) && d.table.length) return true;
-    if (Array.isArray(d?.overview?.table) && d.overview.table.length) return true;
-    return false;
-  };
-
-  // Keep latest season as primary; only borrow standings from previous season if empty
+  const hasTable = (d) => { if (Array.isArray(d?.table) && d.table.length) return true; if (Array.isArray(d?.overview?.table) && d.overview.table.length) return true; return false; };
   let standingsSeason = data.details?.selectedSeason || latest || null;
   let standingsSource = data;
   if (!hasTable(data)) {
     for (const season of seasons.slice(0, 5)) {
       if (season === standingsSeason) continue;
-      try {
-        const d2 = await fotmobGet(`https://www.fotmob.com/api/data/leagues?id=${id}&season=${encodeURIComponent(season)}`);
-        if (hasTable(d2)) { standingsSource = d2; break; }
-      } catch (_) {}
+      try { const d2 = await fotmobGet(`https://www.fotmob.com/api/data/leagues?id=${id}&season=${encodeURIComponent(season)}`); if (hasTable(d2)) { standingsSource = d2; break; } } catch (_) {}
     }
   }
-
-  // table — support top-level table OR overview.table; multi-group tables
   let standings = [];
   let groups = [];
   try {
     const tableSrc = standingsSource || data;
-    const tableRoot = (Array.isArray(tableSrc.table) && tableSrc.table.length)
-      ? tableSrc.table
-      : (Array.isArray(tableSrc.overview?.table) ? tableSrc.overview.table : []);
-
+    const tableRoot = (Array.isArray(tableSrc.table) && tableSrc.table.length) ? tableSrc.table : (Array.isArray(tableSrc.overview?.table) ? tableSrc.overview.table : []);
     for (const t0 of tableRoot) {
       const td = t0?.data || t0 || {};
       const rows = td?.table?.all || td?.table?.All || (Array.isArray(td?.table) ? td.table : []);
       const mapped = mapTableRows(rows);
       const groupName = td.leagueName || td.groupName || t0?.leagueName || null;
-      if (mapped.length) {
-        groups.push({ name: groupName, standings: mapped });
-        standings = standings.concat(mapped);
-      }
+      if (mapped.length) { groups.push({ name: groupName, standings: mapped }); standings = standings.concat(mapped); }
     }
-    // if single group, keep flat standings; if multi, prefer first or all
     if (groups.length === 1) standings = groups[0].standings;
-  } catch (e) {
-    console.error('[table parse]', e.message);
-  }
-
-  // fixtures
+  } catch (e) { console.error('[table parse]', e.message); }
   let fixtures = [];
-  try {
-    fixtures = mapFixtures(data.fixtures?.allMatches || []);
-  } catch (_) {}
-
-  // scorers
+  try { fixtures = mapFixtures(data.fixtures?.allMatches || []); } catch (_) {}
   let scorers = mapScorers(data.stats?.players || []);
   const goalsBlock = (data.stats?.players || []).find(p => p.name === 'goals' || /top scorer/i.test(p.header || ''));
-  if (goalsBlock?.fetchAllUrl) {
-    const full = await fetchFullScorers(goalsBlock.fetchAllUrl);
-    if (full.length) scorers = full;
-  }
-
-  // assists
+  if (goalsBlock?.fetchAllUrl) { const full = await fetchFullScorers(goalsBlock.fetchAllUrl); if (full.length) scorers = full; }
   let assists = [];
   const ass = (data.stats?.players || []).find(p => p.name === 'goal_assist' || /assist/i.test(p.header || ''));
-  if (ass) {
-    assists = (ass.topThree || []).map((p, i) => ({
-      id: p.id,
-      rank: p.rank ?? i + 1,
-      name: p.name,
-      teamId: p.teamId,
-      teamName: p.teamName,
-      assists: p.value,
-      photo: fotmobPhoto(p.id),
-      teamLogo: p.teamId ? `https://images.fotmob.com/image_resources/logo/teamlogo/${p.teamId}_small.png` : null
-    }));
-  }
-
-  // v4.0: assists كاملة + ترتيب فريق اللاعب
+  if (ass) assists = (ass.topThree || []).map((p, i) => ({ id: p.id, rank: p.rank ?? i + 1, name: p.name, teamId: p.teamId, teamName: p.teamName, assists: p.value, photo: fotmobPhoto(p.id), teamLogo: p.teamId ? `https://images.fotmob.com/image_resources/logo/teamlogo/${p.teamId}_small.png` : null }));
   try {
-    if (ass && ass.fetchAllUrl) {
-      const fa = await fetchFullScorers(ass.fetchAllUrl);
-      if (fa.length) assists = fa.map(p => ({ ...p, assists: p.goals, goals: undefined }));
-    }
+    if (ass && ass.fetchAllUrl) { const fa = await fetchFullScorers(ass.fetchAllUrl); if (fa.length) assists = fa.map(p => ({ ...p, assists: p.goals, goals: undefined })); }
     const amap = new Map(assists.map(a => [Number(a.id), a.assists]));
     const srow = new Map(standings.map(s => [Number(s.id), s]));
     const enrichP = p => { const t = srow.get(Number(p.teamId)); p.teamNameAr = p.teamName ? trAr(p.teamName) : null; if (t) { p.teamRank = t.rank; p.teamPlayed = t.played; } };
     scorers.forEach(p => { if (amap.has(Number(p.id))) p.assists = amap.get(Number(p.id)); enrichP(p); });
     assists.forEach(enrichP);
   } catch (e) { console.error('[scorers enrich]', e.message); }
-
   const meta = LEAGUES.find(l => l.id === id) || {};
   const result = {
-    id,
-    name: data.details.name || meta.name,
-    nameAr: meta.nameAr || data.details.name,
-    shortName: data.details.shortName || null,
-    country: data.details.country || meta.country || null,
+    id, name: data.details.name || meta.name, nameAr: meta.nameAr || data.details.name,
+    shortName: data.details.shortName || null, country: data.details.country || meta.country || null,
     season: data.details.selectedSeason || latest || null,
     standingsSeason: (standingsSource && standingsSource.details && standingsSource.details.selectedSeason) || standingsSeason || null,
     type: meta.type || 'league',
     logo: `https://images.fotmob.com/image_resources/logo/leaguelogo/${id}.png`,
-    standings,
-    groups: groups.length > 1 ? groups : undefined,
-    scorers,
-    assists,
-    fixtures,
-    counts: {
-      teams: standings.length,
-      scorers: scorers.length,
-      fixtures: fixtures.length
-    },
+    standings, groups: groups.length > 1 ? groups : undefined, scorers, assists, fixtures,
+    counts: { teams: standings.length, scorers: scorers.length, fixtures: fixtures.length },
     updatedAt: new Date().toISOString()
   };
-
   leagueCache.set(id, { ts: Date.now(), data: result });
   return result;
 }
 
-// ========== PUSH NOTIFICATIONS ==========
+// ========== PUSH ==========
 const SUBS_FILE = path.join(DATA_DIR, 'push-subs.json');
 const VAPID_FILE = path.join(DATA_DIR, 'vapid.json');
 const SENT_FILE = path.join(DATA_DIR, 'push-sent.json');
-
 let VAPID = { publicKey: process.env.VAPID_PUBLIC_KEY || null, privateKey: process.env.VAPID_PRIVATE_KEY || null, source: 'env' };
 if (!VAPID.publicKey || !VAPID.privateKey) {
-  try {
-    const j = JSON.parse(fs.readFileSync(VAPID_FILE, 'utf8'));
-    if (j.publicKey && j.privateKey) VAPID = { publicKey: j.publicKey, privateKey: j.privateKey, source: 'file' };
-  } catch (_) {}
+  try { const j = JSON.parse(fs.readFileSync(VAPID_FILE, 'utf8')); if (j.publicKey && j.privateKey) VAPID = { publicKey: j.publicKey, privateKey: j.privateKey, source: 'file' }; } catch (_) {}
 }
 if (!VAPID.publicKey || !VAPID.privateKey) {
   const gen = webpush.generateVAPIDKeys();
   VAPID = { publicKey: gen.publicKey, privateKey: gen.privateKey, source: 'generated' };
   try { fs.writeFileSync(VAPID_FILE, JSON.stringify({ publicKey: gen.publicKey, privateKey: gen.privateKey })); } catch (_) {}
-  console.log('\n[Push] ⚠ اتولّدت مفاتيح VAPID جديدة. عشان متضيعش بعد أي Redeploy على Railway ضيفهم في Variables:');
+  console.log('\n[Push] ⚠ اتولّدت مفاتيح VAPID جديدة. ضيفهم في Railway:');
   console.log('VAPID_PUBLIC_KEY=' + gen.publicKey);
   console.log('VAPID_PRIVATE_KEY=' + gen.privateKey + '\n');
 }
 webpush.setVapidDetails(process.env.VAPID_SUBJECT || 'mailto:push@sirtv-live.example.com', VAPID.publicKey, VAPID.privateKey);
 
-/** endpoint → { subscription, teams:[{id,names[]}], matches:[key], prefs } */
 const pushSubs = new Map();
 const DEF_PREFS = { goals: 'all', remind: true, kickoff: true, final: true };
-
 function indexSub(e) {
   e.prefs = { ...DEF_PREFS, ...(e.prefs || {}) };
   e._tid = new Set((e.teams || []).map(t => Number(t.id)).filter(Boolean));
@@ -1782,36 +1526,24 @@ function loadSubs() {
   try {
     if (!fs.existsSync(SUBS_FILE)) return;
     const arr = JSON.parse(fs.readFileSync(SUBS_FILE, 'utf8'));
-    if (Array.isArray(arr)) {
-      for (const e of arr) if (e && e.subscription && e.subscription.endpoint) pushSubs.set(e.subscription.endpoint, indexSub(e));
-      console.log('[Push] Loaded', pushSubs.size, 'subscriptions');
-    }
+    if (Array.isArray(arr)) { for (const e of arr) if (e && e.subscription && e.subscription.endpoint) pushSubs.set(e.subscription.endpoint, indexSub(e)); console.log('[Push] Loaded', pushSubs.size, 'subscriptions'); }
   } catch (e) { console.error('[Push] loadSubs', e.message); }
 }
 let saveT = null;
 function saveSubs() {
   clearTimeout(saveT);
   saveT = setTimeout(() => {
-    try {
-      const arr = [...pushSubs.values()].map(({ _tid, _tn, _mk, _lg, ...rest }) => rest);
-      fs.writeFileSync(SUBS_FILE, JSON.stringify(arr));
-    } catch (e) { console.error('[Push] saveSubs', e.message); }
+    try { const arr = [...pushSubs.values()].map(({ _tid, _tn, _mk, _lg, ...rest }) => rest); fs.writeFileSync(SUBS_FILE, JSON.stringify(arr)); } catch (e) { console.error('[Push] saveSubs', e.message); }
   }, 500);
 }
 loadSubs();
 
 function cleanBody(b) {
-  const teams = (Array.isArray(b.teams) ? b.teams : []).slice(0, 40).map(t => ({
-    id: Number(t.id) || null,
-    names: (Array.isArray(t.names) ? t.names : []).slice(0, 10).map(x => String(x).slice(0, 60))
-  }));
+  const teams = (Array.isArray(b.teams) ? b.teams : []).slice(0, 40).map(t => ({ id: Number(t.id) || null, names: (Array.isArray(t.names) ? t.names : []).slice(0, 10).map(x => String(x).slice(0, 60)) }));
   const matches = (Array.isArray(b.matches) ? b.matches : []).slice(0, 200).map(x => String(x).slice(0, 300));
   const leagues = (Array.isArray(b.leagues) ? b.leagues : []).slice(0, 30).map(Number).filter(Boolean);
   const p = b.prefs || {};
-  const prefs = {
-    goals: p.goals === 'mine' ? 'mine' : 'all',
-    remind: p.remind !== false, kickoff: p.kickoff !== false, final: p.final !== false
-  };
+  const prefs = { goals: p.goals === 'mine' ? 'mine' : 'all', remind: p.remind !== false, kickoff: p.kickoff !== false, final: p.final !== false };
   return { teams, matches, leagues, prefs };
 }
 function upsertSub(body) {
@@ -1823,23 +1555,16 @@ function upsertSub(body) {
   saveSubs();
   return e;
 }
-
 async function pushOne(entry, payload, ttl) {
-  try {
-    await webpush.sendNotification(entry.subscription, JSON.stringify(payload), { TTL: ttl || 120, urgency: 'high' });
-    return { ok: true };
-  } catch (e) {
+  try { await webpush.sendNotification(entry.subscription, JSON.stringify(payload), { TTL: ttl || 120, urgency: 'high' }); return { ok: true }; }
+  catch (e) {
     const code = e.statusCode || 0;
     console.error('[Push] send fail', code, (e.body || e.message || '').toString().slice(0, 120));
     if ([401, 403, 404, 410].includes(code)) { pushSubs.delete(entry.subscription.endpoint); saveSubs(); }
     return { ok: false, code, body: e.body || e.message };
   }
 }
-async function pushMany(list, payload, ttl) {
-  let sent = 0;
-  await pool(list, 8, async (e) => { const r = await pushOne(e, payload, ttl); if (r.ok) sent++; });
-  return sent;
-}
+async function pushMany(list, payload, ttl) { let sent = 0; await pool(list, 8, async (e) => { const r = await pushOne(e, payload, ttl); if (r.ok) sent++; }); return sent; }
 
 function followsMatch(e, m) {
   if (e._mk.has(String(m.key))) return true;
@@ -1851,25 +1576,18 @@ function followsMatch(e, m) {
 }
 
 const sentKeys = new Map();
-try {
-  if (fs.existsSync(SENT_FILE)) for (const [k, v] of Object.entries(JSON.parse(fs.readFileSync(SENT_FILE, 'utf8')))) sentKeys.set(k, v);
-} catch (_) {}
+try { if (fs.existsSync(SENT_FILE)) for (const [k, v] of Object.entries(JSON.parse(fs.readFileSync(SENT_FILE, 'utf8')))) sentKeys.set(k, v); } catch (_) {}
 let sentDirty = false;
-function once(k) {
-  if (sentKeys.has(k)) return false;
-  sentKeys.set(k, Date.now()); sentDirty = true; return true;
-}
+function once(k) { if (sentKeys.has(k)) return false; sentKeys.set(k, Date.now()); sentDirty = true; return true; }
 setInterval(() => {
   const cut = Date.now() - 2 * 86400000;
   for (const [k, v] of sentKeys) if (v < cut) { sentKeys.delete(k); sentDirty = true; }
   if (sentDirty) { sentDirty = false; try { fs.writeFileSync(SENT_FILE, JSON.stringify(Object.fromEntries(sentKeys))); } catch (_) {} }
 }, 60 * 1000);
 
-const snap = new Map(); // key → { score, st }
+const snap = new Map();
 const scoreOf = m => (m.homeScore != null && m.awayScore != null) ? [m.homeScore, m.awayScore] : null;
-function seedSnapshot(matches) {
-  for (const m of matches || []) snap.set(m.key, { score: scoreOf(m), st: m.statusType });
-}
+function seedSnapshot(matches) { for (const m of matches || []) snap.set(m.key, { score: scoreOf(m), st: m.statusType }); }
 async function fire(type, m, extra) {
   const hs = m.homeScore ?? 0, as = m.awayScore ?? 0;
   let title, body, ttl = 120;
@@ -1877,11 +1595,7 @@ async function fire(type, m, extra) {
   else if (type === 'remind') { title = '⏰ المباراة بعد 15 دقيقة'; body = `${m.home} × ${m.away}${m.time ? ' — ' + m.time : ''}`; ttl = 600; }
   else if (type === 'kickoff') { title = '🔔 بدأت المباراة'; body = `${m.home} × ${m.away}`; ttl = 300; }
   else { title = '🏁 انتهت المباراة'; body = `${m.home} ${hs} - ${as} ${m.away}`; ttl = 3600; }
-  const payload = {
-    title, body, tag: `${type}-${m.key}${type === 'goal' ? '-' + hs + '-' + as : ''}`,
-    icon: m.homeLogo || undefined,
-    data: { type, key: m.key, link: m.link, home: m.home, away: m.away, url: '#m=' + encodeURIComponent(m.key) }
-  };
+  const payload = { title, body, tag: `${type}-${m.key}${type === 'goal' ? '-' + hs + '-' + as : ''}`, icon: m.homeLogo || undefined, data: { type, key: m.key, link: m.link, home: m.home, away: m.away, url: '#m=' + encodeURIComponent(m.key) } };
   const targets = [...pushSubs.values()].filter(e => {
     const mine = followsMatch(e, m);
     if (type === 'goal') return e.prefs.goals === 'all' || mine;
@@ -1898,50 +1612,35 @@ function notifyTick(matches) {
     const prev = snap.get(m.key);
     const score = scoreOf(m);
     snap.set(m.key, { score, st: m.statusType });
-
-    if (m.statusType === 'upcoming' && m.startMs) {
-      const dt = m.startMs - now;
-      if (dt > 0 && dt <= 15 * 60000 + 30000 && once('rem:' + m.key)) fire('remind', m);
-    }
+    if (m.statusType === 'upcoming' && m.startMs) { const dt = m.startMs - now; if (dt > 0 && dt <= 15 * 60000 + 30000 && once('rem:' + m.key)) fire('remind', m); }
     if (!prev) continue;
     if (prev.st === 'upcoming' && m.statusType === 'live' && once('ko:' + m.key)) fire('kickoff', m);
     if (prev.st !== 'finished' && m.statusType === 'finished' && once('ft:' + m.key)) fire('final', m);
     if (score && m.statusType !== 'upcoming') {
       const p = prev.score || [0, 0];
-      if (score[0] + score[1] > p[0] + p[1] && once(`g:${m.key}:${score[0]}-${score[1]}`)) {
-        fire('goal', m, { team: score[0] > p[0] ? m.home : m.away });
-      }
+      if (score[0] + score[1] > p[0] + p[1] && once(`g:${m.key}:${score[0]}-${score[1]}`)) fire('goal', m, { team: score[0] > p[0] ? m.home : m.away });
     }
   }
 }
 
-// ========== v4.0: أخبار / ملخصات / ملخص تلقائي / لاعب ==========
+// ========== NEWS / HIGHLIGHTS / EXTRAS / PLAYER ==========
 const NEWS_TTL = 10 * 60 * 1000;
 const gnews = q => `https://news.google.com/rss/search?q=${encodeURIComponent(q)}&hl=ar&gl=EG&ceid=EG:ar`;
 let NEWS_FEEDS = [
   { id: 'gn-football', name: 'أخبار كرة القدم', url: gnews('كرة القدم when:2d') },
-  { id: 'gn-egypt',    name: 'الكرة المصرية',    url: gnews('الدوري المصري when:2d') },
-  { id: 'gn-world',    name: 'الكرة العالمية',   url: gnews('الدوري الإنجليزي OR الدوري الإسباني OR دوري أبطال أوروبا when:2d') },
-  { id: 'bbc-sport',   name: 'BBC عربي رياضة',  url: 'https://feeds.bbci.co.uk/arabic/sports/rss.xml' }
+  { id: 'gn-egypt', name: 'الكرة المصرية', url: gnews('الدوري المصري when:2d') },
+  { id: 'gn-world', name: 'الكرة العالمية', url: gnews('الدوري الإنجليزي OR الدوري الإسباني OR دوري أبطال أوروبا when:2d') },
+  { id: 'bbc-sport', name: 'BBC عربي رياضة', url: 'https://feeds.bbci.co.uk/arabic/sports/rss.xml' }
 ];
-try {
-  const extra = JSON.parse(process.env.NEWS_FEEDS || '[]');   // [{id,name,url}]
-  if (Array.isArray(extra)) NEWS_FEEDS = NEWS_FEEDS.concat(extra.filter(f => f && f.url));
-} catch (_) {}
-const HL_CHANNELS = String(process.env.HL_CHANNELS || '').split(',').map(s => s.trim()).filter(Boolean); // channel_id أو channel_id:اسم
+try { const extra = JSON.parse(process.env.NEWS_FEEDS || '[]'); if (Array.isArray(extra)) NEWS_FEEDS = NEWS_FEEDS.concat(extra.filter(f => f && f.url)); } catch (_) {}
+const HL_CHANNELS = String(process.env.HL_CHANNELS || '').split(',').map(s => s.trim()).filter(Boolean);
+const feedCache = new Map();
+const feedStatus = new Map();
+const ytCache = new Map();
 
-const feedCache = new Map();   // url → { ts, items, ok, err }
-const feedStatus = new Map();  // id → { ok, count, err, ts }
-const ytCache = new Map();     // q → { ts, items }
-
-function stripHtml(s) {
-  return String(s || '').replace(/<[^>]*>/g, ' ').replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/\s+/g, ' ').trim();
-}
+function stripHtml(s) { return String(s || '').replace(/<[^>]*>/g, ' ').replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/\s+/g, ' ').trim(); }
 function hashStr(s) { let h = 5381; for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0; return (h >>> 0).toString(36); }
-
-function xmlUnesc(s) {
-  return String(s || '').replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, '$1').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&apos;|&#39;/g, "'").replace(/&amp;/g, '&');
-}
+function xmlUnesc(s) { return String(s || '').replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, '$1').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&apos;|&#39;/g, "'").replace(/&amp;/g, '&'); }
 const xmlTag = (blk, tag) => { const m = blk.match(new RegExp('<' + tag + '(?:\\s[^>]*)?>([\\s\\S]*?)</' + tag + '>', 'i')); return m ? xmlUnesc(m[1]).trim() : ''; };
 const xmlAttr = (blk, tag, attr) => { const m = blk.match(new RegExp('<' + tag + '\\s[^>]*?' + attr + '=["\']([^"\']+)["\']', 'i')); return m ? xmlUnesc(m[1]) : null; };
 function parseRss(xml, feedName) {
@@ -1965,7 +1664,6 @@ function parseRss(xml, feedName) {
   }
   return out;
 }
-
 async function fetchFeed(url, name) {
   const hit = feedCache.get(url);
   if (hit && Date.now() - hit.ts < NEWS_TTL) return hit;
@@ -1977,12 +1675,11 @@ async function fetchFeed(url, name) {
     feedCache.set(url, rec);
     return rec;
   } catch (e) {
-    const rec = { ts: Date.now() - NEWS_TTL + 60 * 1000, items: (hit && hit.items) || [], ok: false, err: e.message }; // نعيد المحاولة بعد دقيقة
+    const rec = { ts: Date.now() - NEWS_TTL + 60 * 1000, items: (hit && hit.items) || [], ok: false, err: e.message };
     feedCache.set(url, rec);
     return rec;
   }
 }
-
 function dedupeNews(list) {
   const seen = new Set(), out = [];
   for (const n of list.sort((a, b) => (b.ts || 0) - (a.ts || 0))) {
@@ -1992,7 +1689,6 @@ function dedupeNews(list) {
   }
   return out;
 }
-
 async function getGeneralNews() {
   const res = await Promise.all(NEWS_FEEDS.map(async f => {
     const r = await fetchFeed(f.url, f.name);
@@ -2001,25 +1697,12 @@ async function getGeneralNews() {
   }));
   return dedupeNews(res.flat());
 }
-async function getTopicNews(q, name) {
-  const r = await fetchFeed(gnews(`${q} كرة القدم when:7d`), name || q);
-  return r.items.map(i => ({ ...i, topic: q }));
-}
-
-// ---- يوتيوب: بحث عن ملخصات ----
+async function getTopicNews(q, name) { const r = await fetchFeed(gnews(`${q} كرة القدم when:7d`), name || q); return r.items.map(i => ({ ...i, topic: q })); }
 function ytWalk(o, out) {
   if (!o || typeof o !== 'object') return;
   if (o.videoRenderer && o.videoRenderer.videoId) {
     const v = o.videoRenderer;
-    out.push({
-      id: v.videoId,
-      title: (v.title && (v.title.runs || []).map(r => r.text).join('')) || '',
-      channel: (v.ownerText && v.ownerText.runs && v.ownerText.runs[0] && v.ownerText.runs[0].text) || '',
-      dur: (v.lengthText && v.lengthText.simpleText) || '',
-      ago: (v.publishedTimeText && v.publishedTimeText.simpleText) || '',
-      views: (v.shortViewCountText && v.shortViewCountText.simpleText) || '',
-      thumb: `https://i.ytimg.com/vi/${v.videoId}/hqdefault.jpg`
-    });
+    out.push({ id: v.videoId, title: (v.title && (v.title.runs || []).map(r => r.text).join('')) || '', channel: (v.ownerText && v.ownerText.runs && v.ownerText.runs[0] && v.ownerText.runs[0].text) || '', dur: (v.lengthText && v.lengthText.simpleText) || '', ago: (v.publishedTimeText && v.publishedTimeText.simpleText) || '', views: (v.shortViewCountText && v.shortViewCountText.simpleText) || '', thumb: `https://i.ytimg.com/vi/${v.videoId}/hqdefault.jpg` });
     return;
   }
   for (const k in o) ytWalk(o[k], out);
@@ -2029,11 +1712,7 @@ async function ytSearch(q) {
   if (hit && Date.now() - hit.ts < 20 * 60 * 1000) return hit.items;
   let items = [];
   try {
-    const r = await axios.get('https://www.youtube.com/results', {
-      params: { search_query: q, hl: 'ar', gl: 'EG', sp: 'EgIQAQ%253D%253D' },
-      headers: { 'User-Agent': UA, 'Accept-Language': 'ar,en;q=0.8', Cookie: 'CONSENT=YES+1' },
-      timeout: 12000, responseType: 'text', validateStatus: s => s < 500
-    });
+    const r = await axios.get('https://www.youtube.com/results', { params: { search_query: q, hl: 'ar', gl: 'EG', sp: 'EgIQAQ%253D%253D' }, headers: { 'User-Agent': UA, 'Accept-Language': 'ar,en;q=0.8', Cookie: 'CONSENT=YES+1' }, timeout: 12000, responseType: 'text', validateStatus: s => s < 500 });
     const m = String(r.data).match(/var ytInitialData\s*=\s*(\{.*?\});<\/script>/s);
     if (m) { const out = []; ytWalk(JSON.parse(m[1]), out); items = out; }
   } catch (e) { console.error('[yt]', e.message); }
@@ -2043,10 +1722,7 @@ async function ytSearch(q) {
 async function ytChannelFeed(spec) {
   const [cid, ...rest] = spec.split(':');
   const r = await fetchFeed(`https://www.youtube.com/feeds/videos.xml?channel_id=${cid}`, rest.join(':') || cid);
-  return r.items.map(i => {
-    const vid = (String(i.link).match(/[?&]v=([\w-]{6,})/) || [])[1];
-    return vid ? { id: vid, title: i.title, channel: i.source, ago: '', dur: '', thumb: `https://i.ytimg.com/vi/${vid}/hqdefault.jpg`, ts: i.ts } : null;
-  }).filter(Boolean);
+  return r.items.map(i => { const vid = (String(i.link).match(/[?&]v=([\w-]{6,})/) || [])[1]; return vid ? { id: vid, title: i.title, channel: i.source, ago: '', dur: '', thumb: `https://i.ytimg.com/vi/${vid}/hqdefault.jpg`, ts: i.ts } : null; }).filter(Boolean);
 }
 const HL_RX = /ملخص|أهداف|اهداف|highlights|goals/i;
 async function getHighlights(q) {
@@ -2062,7 +1738,6 @@ async function getHighlights(q) {
   return vids.filter(v => !seen.has(v.id) && seen.add(v.id)).slice(0, 8);
 }
 
-// ---- ملخص نصي تلقائي للمباراة (من بيانات FotMob) ----
 function buildSummary(d, home, away) {
   if (!d || !d.info) return null;
   const hs = d.info.homeScore, as = d.info.awayScore;
@@ -2092,15 +1767,13 @@ function buildSummary(d, home, away) {
   return lines.length ? lines : null;
 }
 
-
-// ---- v4.3: قارئ المقالات ----
 const articleCache = new Map();
 const privateHost = h => /^(localhost|0\.0\.0\.0|127\.|10\.|192\.168\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.|\[?::1)/i.test(h) || !/\./.test(h);
 async function resolveGoogleNews(url) {
   const m = url.match(/news\.google\.com\/(?:rss\/)?articles\/([^?/#]+)/i);
   if (!m) return url;
   const id = m[1];
-  try { // الصيغة القديمة: base64 فيه الرابط
+  try {
     const raw = Buffer.from(id.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('latin1');
     const u = raw.match(/https?:\/\/[\x21-\x7e]+/);
     if (u && !/news\.google/.test(u[0])) return u[0];
@@ -2179,19 +1852,11 @@ async function getExtras({ link, id, home, away, hAr, aAr }) {
     h && a ? getTopicNews(`${h} ${a}`, 'المباراة') : Promise.resolve([])
   ];
   const [vids, news] = await Promise.all(jobs);
-  const data = {
-    summary: buildSummary(d, h, a),
-    officialHighlight: (d && d.highlight) || null,
-    videos: vids,
-    news: news.slice(0, 6),
-    searchUrl: h && a ? `https://www.youtube.com/results?search_query=${encodeURIComponent(`${h} ${a} ملخص`)}` : null,
-    finished: !!finished
-  };
+  const data = { summary: buildSummary(d, h, a), officialHighlight: (d && d.highlight) || null, videos: vids, news: news.slice(0, 6), searchUrl: h && a ? `https://www.youtube.com/results?search_query=${encodeURIComponent(`${h} ${a} ملخص`)}` : null, finished: !!finished };
   extrasCache.set(ck, { ts: Date.now(), data });
   return data;
 }
 
-// ---- بيانات اللاعب (FotMob playerData) ----
 const playerCache = new Map();
 const INFO_AR = { height: 'الطول', shirt: 'رقم القميص', age: 'السن', preferred_foot: 'القدم المفضلة', country: 'الجنسية', transfer_value: 'القيمة السوقية', contract_end: 'نهاية العقد', position: 'المركز' };
 const FOOT_AR = { right: 'اليمنى', left: 'اليسرى', both: 'الاتنين', Right: 'اليمنى', Left: 'اليسرى', Both: 'الاتنين' };
@@ -2215,43 +1880,24 @@ async function getPlayer(id) {
   const bd = d.birthDate && (d.birthDate.utcTime || d.birthDate);
   const stats = [];
   const ml = d.mainLeague || {};
-  for (const s of ml.stats || []) {
-    const v = s.value != null ? s.value : s.statValue;
-    if (v == null || !(s.title || s.localizedTitleId)) continue;
-    stats.push({ key: s.localizedTitleId || s.title, title: s.title || s.localizedTitleId, value: v });
-  }
+  for (const s of ml.stats || []) { const v = s.value != null ? s.value : s.statValue; if (v == null || !(s.title || s.localizedTitleId)) continue; stats.push({ key: s.localizedTitleId || s.title, title: s.title || s.localizedTitleId, value: v }); }
   const pos = d.positionDescription || {};
-  const recent = (d.recentMatches || []).slice(0, 6).map(m => ({
-    date: m.matchDate && (m.matchDate.utcTime || m.matchDate), opp: m.opponentTeamName || null,
-    home: m.isHomeTeam, score: m.homeScore != null ? `${m.homeScore}-${m.awayScore}` : null,
-    rating: m.ratingProps && m.ratingProps.num ? m.ratingProps.num : null,
-    goals: m.goals || 0, assists: m.assists || 0, minutes: m.minutesPlayed || null
-  }));
-  const data = {
-    id, name: d.name, photo: fotmobPhoto(id),
-    teamId: d.primaryTeam && d.primaryTeam.teamId, team: d.primaryTeam && d.primaryTeam.teamName,
-    teamAr: d.primaryTeam && d.primaryTeam.teamName ? trAr(d.primaryTeam.teamName) : null,
-    teamLogo: d.primaryTeam && d.primaryTeam.teamId ? `https://images.fotmob.com/image_resources/logo/teamlogo/${d.primaryTeam.teamId}_small.png` : null,
-    position: (pos.primaryPosition && pos.primaryPosition.label) || null,
-    positions: (pos.positions || []).map(p => p.strPos && p.strPos.label || p.label).filter(Boolean),
-    birth: bd || null, captain: !!d.isCaptain,
-    info, league: ml.leagueName || null, season: ml.season || null, stats, recent
-  };
+  const recent = (d.recentMatches || []).slice(0, 6).map(m => ({ date: m.matchDate && (m.matchDate.utcTime || m.matchDate), opp: m.opponentTeamName || null, home: m.isHomeTeam, score: m.homeScore != null ? `${m.homeScore}-${m.awayScore}` : null, rating: m.ratingProps && m.ratingProps.num ? m.ratingProps.num : null, goals: m.goals || 0, assists: m.assists || 0, minutes: m.minutesPlayed || null }));
+  const data = { id, name: d.name, photo: fotmobPhoto(id), teamId: d.primaryTeam && d.primaryTeam.teamId, team: d.primaryTeam && d.primaryTeam.teamName, teamAr: d.primaryTeam && d.primaryTeam.teamName ? trAr(d.primaryTeam.teamName) : null, teamLogo: d.primaryTeam && d.primaryTeam.teamId ? `https://images.fotmob.com/image_resources/logo/teamlogo/${d.primaryTeam.teamId}_small.png` : null, position: (pos.primaryPosition && pos.primaryPosition.label) || null, positions: (pos.positions || []).map(p => p.strPos && p.strPos.label || p.label).filter(Boolean), birth: bd || null, captain: !!d.isCaptain, info, league: ml.leagueName || null, season: ml.season || null, stats, recent };
   playerCache.set(id, { ts: Date.now(), data });
   return data;
 }
 
-// ========== v5.0: روابط البث اليدوية (لوحة تحكم + Firebase) ==========
-const crypto = require('crypto');
+// ========== MANUAL STREAMS ==========
 const FIREBASE_URL = String(process.env.FIREBASE_DB_URL || 'https://english-73376-default-rtdb.firebaseio.com').replace(/\/+$/, '');
-const FIREBASE_SECRET = process.env.FIREBASE_SECRET || '';           // اختياري: Database secret لو الـ rules مقفولة
+const FIREBASE_SECRET = process.env.FIREBASE_SECRET || '';
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '';
 const STREAMS_FILE = path.join(DATA_DIR, 'manual-streams.json');
 const fbAuth = FIREBASE_SECRET ? `?auth=${encodeURIComponent(FIREBASE_SECRET)}` : '';
 const fbUrl = p => `${FIREBASE_URL}/${p}.json${fbAuth}`;
 
-const manualStreams = new Map();   // safeKey → entry
-const manualByTeams = new Map();   // "home|away" → safeKey
+const manualStreams = new Map();
+const manualByTeams = new Map();
 let fbState = { ok: null, err: null, ts: 0 };
 const safeKey = k => Buffer.from(String(k || ''), 'utf8').toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '').slice(0, 120);
 const teamsKey = (h, a) => `${stripAl(normAr(h))}|${stripAl(normAr(a))}`;
@@ -2277,11 +1923,7 @@ function indexManual() {
   for (const [sk, e] of manualStreams) if (e.home && e.away) manualByTeams.set(teamsKey(e.home, e.away), sk);
 }
 function saveManualLocal() { try { fs.writeFileSync(STREAMS_FILE, JSON.stringify([...manualStreams.values()])); } catch (_) {} }
-try {
-  const arr = JSON.parse(fs.readFileSync(STREAMS_FILE, 'utf8'));
-  for (const e of arr) if (e && e.key) manualStreams.set(safeKey(e.key), e);
-  indexManual();
-} catch (_) {}
+try { const arr = JSON.parse(fs.readFileSync(STREAMS_FILE, 'utf8')); for (const e of arr) if (e && e.key) manualStreams.set(safeKey(e.key), e); indexManual(); } catch (_) {}
 
 async function loadManualFromFirebase() {
   try {
@@ -2298,33 +1940,27 @@ async function pushManualToFirebase(sk, entry) {
   const r = entry
     ? await axios.put(fbUrl('streams/' + sk), entry, { timeout: 12000, validateStatus: s => s < 500 })
     : await axios.delete(fbUrl('streams/' + sk), { timeout: 12000, validateStatus: s => s < 500 });
-  if (r.status >= 400) throw new Error('Firebase HTTP ' + r.status + (r.status === 401 || r.status === 403 ? ' — الـ rules مقفولة، ضيف FIREBASE_SECRET في Railway أو افتح الكتابة' : ''));
+  if (r.status >= 400) throw new Error('Firebase HTTP ' + r.status + (r.status === 401 || r.status === 403 ? ' — ضيف FIREBASE_SECRET' : ''));
 }
 function manualFor(key, link, home, away) {
   if (key && manualStreams.has(safeKey(key))) return manualStreams.get(safeKey(key));
   let m = null;
   if (link) m = cache.matches.find(x => x.link === link);
   else if (key) m = cache.matches.find(x => String(x.key) === String(key));
-  if (m) {
-    const e = manualStreams.get(safeKey(m.key)) || manualStreams.get(manualByTeams.get(teamsKey(m.home, m.away)));
-    if (e) return e;
-  }
+  if (m) { const e = manualStreams.get(safeKey(m.key)) || manualStreams.get(manualByTeams.get(teamsKey(m.home, m.away))); if (e) return e; }
   if (home && away) { const sk = manualByTeams.get(teamsKey(home, away)); if (sk) return manualStreams.get(sk); }
   return null;
 }
 const expiryOf = u => { try { const e = Number(new URL(u).searchParams.get('expires')); return e > 1e9 ? e * 1000 : null; } catch (_) { return null; } };
 
 function adminAuth(req, res, next) {
-  if (!ADMIN_PASSWORD) return res.status(503).json({ success: false, error: 'ADMIN_PASSWORD مش متحدد في متغيرات Railway' });
+  if (!ADMIN_PASSWORD) return res.status(503).json({ success: false, error: 'ADMIN_PASSWORD مش متحدد' });
   const ip = req.ip || '';
   const f = adminFails.get(ip);
-  if (f && f.n >= 10 && Date.now() - f.ts < 10 * 60 * 1000) return res.status(429).json({ success: false, error: 'محاولات كتير — استنى شوية' });
+  if (f && f.n >= 10 && Date.now() - f.ts < 10 * 60 * 1000) return res.status(429).json({ success: false, error: 'محاولات كتير' });
   const a = crypto.createHash('sha256').update(String(req.headers['x-admin-key'] || '')).digest();
   const b = crypto.createHash('sha256').update(ADMIN_PASSWORD).digest();
-  if (!crypto.timingSafeEqual(a, b)) {
-    adminFails.set(ip, { n: ((f && Date.now() - f.ts < 10 * 60 * 1000) ? f.n : 0) + 1, ts: Date.now() });
-    return res.status(401).json({ success: false, error: 'كلمة السر غلط' });
-  }
+  if (!crypto.timingSafeEqual(a, b)) { adminFails.set(ip, { n: ((f && Date.now() - f.ts < 10 * 60 * 1000) ? f.n : 0) + 1, ts: Date.now() }); return res.status(401).json({ success: false, error: 'كلمة السر غلط' }); }
   adminFails.delete(ip);
   next();
 }
@@ -2362,130 +1998,53 @@ app.post('/api/admin/test', adminAuth, async (req, res) => {
   const url = String(b.url || '');
   try {
     if (!/^https?:\/\//i.test(url) || privateHost(new URL(url).hostname)) throw new Error('رابط غير صالح');
-    const hdr = streamHeaders({ referer: b.referer, origin: b.origin, ua: b.ua, cookie: b.cookie, accept: b.accept });
+    const hdr = isSyriaUrl(url) ? syriaHeaders('https://1cdn.syria-player.info') : streamHeaders({ referer: b.referer, origin: b.origin, ua: b.ua, cookie: b.cookie, accept: b.accept });
     const r = await axios.get(url, { headers: hdr, timeout: 15000, responseType: 'text', validateStatus: () => true, maxContentLength: 2e6 });
     const body = String(r.data || '');
     const isM3u8 = body.trim().startsWith('#EXTM3U');
     let seg = null;
     if (isM3u8) {
       const line = body.split(/\r?\n/).find(l => l && !l.startsWith('#'));
-      if (line) {
-        try {
-          const sr = await axios.get(new URL(line, url).href, { headers: hdr, timeout: 15000, responseType: 'arraybuffer', validateStatus: () => true, maxContentLength: 3e6 });
-          seg = { status: sr.status, bytes: (sr.data && sr.data.byteLength) || 0 };
-        } catch (e) { seg = { error: e.message }; }
-      }
+      if (line) { try { const sr = await axios.get(new URL(line, url).href, { headers: hdr, timeout: 15000, responseType: 'arraybuffer', validateStatus: () => true, maxContentLength: 3e6 }); seg = { status: sr.status, bytes: (sr.data && sr.data.byteLength) || 0 }; } catch (e) { seg = { error: e.message }; } }
     }
     res.json({ success: true, status: r.status, isM3u8, master: /#EXT-X-STREAM-INF/.test(body), segment: seg, expiresAt: expiryOf(url), snippet: body.slice(0, 300) });
   } catch (e) { res.json({ success: false, error: e.message }); }
 });
 
-// هيدرز الطلب للمصدر (نفس اللي المتصفح بيبعته)
-// هيدرز ثابتة — نفس الطلب اللي المتصفح بيبعته للمصدر (قابلة للتغيير من متغيرات Railway)
-const STREAM_DEFAULTS = {
-  referer: process.env.STREAM_REFERER || 'https://2.shootsimo.net/',
-  origin: process.env.STREAM_ORIGIN || 'https://2.shootsimo.net',
-  ua: process.env.STREAM_UA || 'Mozilla/5.0 (Linux; Android 15; CPH2591 Build/AP3A.240617.008) AppleWebKit/537.36 (KHTML, like Gecko) Jrryilw/4.0 Chrome/155.0.8059.43 Mobile Safari/537.36',
-  accept: process.env.STREAM_ACCEPT || 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.9',
-  cookie: process.env.STREAM_COOKIE || 'twk_idm_key=oTP2PN1sVaXKX64FXRcDv; TawkConnectionTime=0; twk_uuid_6a5199a020e17a1d43af9db4=%7B%22uuid%22%3A%221.1vXroIhhviNS0LXiqv0qN8nqMJ9WdftZvPq5nXlFzrhY2OC9M7aKn3D47MmK57GENy0huIqWXXJwnD3vmeAgxfuGPVINoWvxbuZ0GVvkPCGfbcGfOkEjfg2%22%2C%22version%22%3A3%2C%22domain%22%3A%22shootsimo.net%22%2C%22ts%22%3A1793134147168%7D'
-};
-function streamHeaders(e) {
-  e = e || {};
-  const ref = e.referer || (e.origin ? e.origin + '/' : STREAM_DEFAULTS.referer);
-  let origin = e.origin;
-  if (!origin) { try { origin = new URL(ref).origin; } catch (_) { origin = STREAM_DEFAULTS.origin; } }
-  const h = {
-    Origin: origin,
-    Accept: e.accept || STREAM_DEFAULTS.accept,
-    'Accept-Encoding': 'identity',
-    'User-Agent': e.ua || STREAM_DEFAULTS.ua,
-    Referer: ref,
-    Connection: 'keep-alive'
-  };
-  const ck = e.cookie || STREAM_DEFAULTS.cookie;
-  if (ck) h.Cookie = ck;
-  return h;
-}
-setInterval(loadManualFromFirebase, 30 * 1000);
-loadManualFromFirebase();
-
 // ========== ROUTES ==========
 app.get('/api/matches', (req, res) => res.json({ success: true, ...cache }));
 
-// قائمة الدوريات والبطولات
 app.get('/api/leagues', (req, res) => {
-  res.json({
-    success: true,
-    leagues: LEAGUES.filter(l => !leagueBad.has(l.id)).map(l => ({
-      id: l.id, name: l.name, nameAr: l.nameAr, country: l.country, type: l.type,
-      logo: `https://images.fotmob.com/image_resources/logo/leaguelogo/${l.id}.png`
-    }))
-  });
+  res.json({ success: true, leagues: LEAGUES.filter(l => !leagueBad.has(l.id)).map(l => ({ id: l.id, name: l.name, nameAr: l.nameAr, country: l.country, type: l.type, logo: `https://images.fotmob.com/image_resources/logo/leaguelogo/${l.id}.png` })) });
 });
-// تفاصيل دوري: ترتيب + هدافين + مباريات
 app.get('/api/league/:id/groups', async (req, res) => {
   try {
     const data = await fetchLeagueDetails(req.params.id);
-    res.json({
-      success: true,
-      league: { id: data.id, name: data.name, nameAr: data.nameAr, season: data.season, type: data.type },
-      groups: Array.isArray(data.groups) && data.groups.length
-        ? data.groups
-        : (data.standings?.length ? [{ name: data.nameAr || data.name || 'الترتيب', standings: data.standings }] : []),
-      hasGroups: Array.isArray(data.groups) && data.groups.length > 1,
-      updatedAt: data.updatedAt
-    });
-  } catch (e) {
-    res.status(500).json({ success: false, error: e.message });
-  }
+    res.json({ success: true, league: { id: data.id, name: data.name, nameAr: data.nameAr, season: data.season, type: data.type }, groups: Array.isArray(data.groups) && data.groups.length ? data.groups : (data.standings?.length ? [{ name: data.nameAr || data.name || 'الترتيب', standings: data.standings }] : []), hasGroups: Array.isArray(data.groups) && data.groups.length > 1, updatedAt: data.updatedAt });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
 });
-
 app.get('/api/league/:id', async (req, res) => {
-  try {
-    const data = await fetchLeagueDetails(req.params.id);
-    res.json({ success: true, league: data });
-  } catch (e) {
-    console.error('[League]', e.message);
-    res.status(500).json({ success: false, error: e.message });
-  }
+  try { const data = await fetchLeagueDetails(req.params.id); res.json({ success: true, league: data }); }
+  catch (e) { console.error('[League]', e.message); res.status(500).json({ success: false, error: e.message }); }
 });
-
 app.get('/api/league', async (req, res) => {
   const id = req.query.id;
   if (!id) return res.status(400).json({ success: false, error: 'id required' });
-  try {
-    const data = await fetchLeagueDetails(id);
-    res.json({ success: true, league: data });
-  } catch (e) {
-    res.status(500).json({ success: false, error: e.message });
-  }
+  try { const data = await fetchLeagueDetails(id); res.json({ success: true, league: data }); }
+  catch (e) { res.status(500).json({ success: false, error: e.message }); }
 });
-
 
 app.get('/api/match/details', async (req, res) => {
   const link = req.query.link ? decodeURIComponent(req.query.link) : null;
   const id = req.query.id || null;
   const home = req.query.home ? decodeURIComponent(req.query.home) : null;
   const away = req.query.away ? decodeURIComponent(req.query.away) : null;
-
-  if (!link && !id && !(home && away)) {
-    return res.status(400).json({ success: false, error: 'link, id, or home+away required' });
-  }
-
-  try {
-    const details = await fetchMatchDetails(link, id, home, away);
-    res.json({ success: true, details });
-  } catch (e) {
-    res.status(500).json({ success: false, error: e.message });
-  }
+  if (!link && !id && !(home && away)) return res.status(400).json({ success: false, error: 'link, id, or home+away required' });
+  try { const details = await fetchMatchDetails(link, id, home, away); res.json({ success: true, details }); }
+  catch (e) { res.status(500).json({ success: false, error: e.message }); }
 });
 
-
-// ===== v3.9: ترتيب الفرق / متابعة الفرق / فحص الوقت =====
-const teamBrief = t => ({
-  id: t.id, name: t.name, nameAr: teamArName(t), logo: t.logo, aliases: teamAliasesAr(t),
-  rank: t.domestic ? { rank: t.domestic.rank, pts: t.domestic.pts, played: t.domestic.played, gd: t.domestic.gd, leagueId: t.domestic.leagueId, league: t.domestic.leagueNameAr } : null
-});
+const teamBrief = t => ({ id: t.id, name: t.name, nameAr: teamArName(t), logo: t.logo, aliases: teamAliasesAr(t), rank: t.domestic ? { rank: t.domestic.rank, pts: t.domestic.pts, played: t.domestic.played, gd: t.domestic.gd, leagueId: t.domestic.leagueId, league: t.domestic.leagueNameAr } : null });
 
 app.get('/api/ranks', async (req, res) => {
   if (!teamIndex.byId.size) { try { await buildTeamIndex(true); } catch (_) {} }
@@ -2493,7 +2052,6 @@ app.get('/api/ranks', async (req, res) => {
   for (const t of teamIndex.byId.values()) if (t.domestic) teams[t.id] = teamBrief(t);
   res.json({ success: true, count: Object.keys(teams).length, builtAt: teamIndex.builtAt, teams });
 });
-
 app.get('/api/teams/search', async (req, res) => {
   if (!teamIndex.byId.size) { try { await buildTeamIndex(true); } catch (_) {} }
   const q = String(req.query.q || '').trim();
@@ -2503,20 +2061,12 @@ app.get('/api/teams/search', async (req, res) => {
   for (const t of teamIndex.byId.values()) {
     const names = [normEn(t.name), normEn(t.short), ...teamAliasesAr(t).map(normAr)].filter(Boolean);
     let sc = 0;
-    for (const n of names) {
-      for (const x of [k, k2, ke]) {
-        if (!x) continue;
-        if (n === x || stripAl(n) === x) sc = Math.max(sc, 3);
-        else if (n.startsWith(x) || stripAl(n).startsWith(x)) sc = Math.max(sc, 2);
-        else if (n.includes(x)) sc = Math.max(sc, 1);
-      }
-    }
+    for (const n of names) for (const x of [k, k2, ke]) { if (!x) continue; if (n === x || stripAl(n) === x) sc = Math.max(sc, 3); else if (n.startsWith(x) || stripAl(n).startsWith(x)) sc = Math.max(sc, 2); else if (n.includes(x)) sc = Math.max(sc, 1); }
     if (sc) scored.push({ sc, t });
   }
   scored.sort((a, b) => b.sc - a.sc || (a.t.domestic ? 0 : 1) - (b.t.domestic ? 0 : 1));
   res.json({ success: true, teams: scored.slice(0, 15).map(x => teamBrief(x.t)) });
 });
-
 app.get('/api/team/:id', async (req, res) => {
   if (!teamIndex.byId.size) { try { await buildTeamIndex(true); } catch (_) {} }
   const t = teamIndex.byId.get(Number(req.params.id));
@@ -2524,8 +2074,6 @@ app.get('/api/team/:id', async (req, res) => {
   res.json({ success: true, team: teamSummary(t) });
 });
 
-// بيرجّع الوقت الخام من المصدر والوقت بعد التصحيح — عشان تتأكد من SRC_SHIFT_MIN
-// ===== v4.0: routes =====
 app.get('/api/news', async (req, res) => {
   try {
     const limit = Math.min(60, Number(req.query.limit) || 30);
@@ -2546,10 +2094,8 @@ app.get('/api/news/status', (req, res) => {
   res.json({ success: true, feeds: NEWS_FEEDS.map(f => ({ id: f.id, url: f.url, ...(feedStatus.get(f.id) || { ok: null }) })), highlightsChannels: HL_CHANNELS });
 });
 app.get('/api/highlights', async (req, res) => {
-  try {
-    const q = String(req.query.q || '').trim() || 'ملخص مباراة اليوم كرة القدم';
-    res.json({ success: true, items: await getHighlights(q) });
-  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+  try { const q = String(req.query.q || '').trim() || 'ملخص مباراة اليوم كرة القدم'; res.json({ success: true, items: await getHighlights(q) }); }
+  catch (e) { res.status(500).json({ success: false, error: e.message }); }
 });
 app.get('/api/match/extras', async (req, res) => {
   const link = req.query.link ? decodeURIComponent(req.query.link) : null;
@@ -2562,11 +2108,8 @@ app.get('/api/match/extras', async (req, res) => {
   catch (e) { res.status(500).json({ success: false, error: e.message }); }
 });
 app.get('/api/player/:id', async (req, res) => {
-  try {
-    const p = await getPlayer(req.params.id);
-    if (!p) return res.status(404).json({ success: false, error: 'not found' });
-    res.json({ success: true, player: p });
-  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+  try { const p = await getPlayer(req.params.id); if (!p) return res.status(404).json({ success: false, error: 'not found' }); res.json({ success: true, player: p }); }
+  catch (e) { res.status(500).json({ success: false, error: e.message }); }
 });
 
 app.get('/api/debug/stream', async (req, res) => {
@@ -2601,78 +2144,98 @@ app.get('/embed', async (req, res) => {
 });
 
 app.get('/api/debug/time', (req, res) => {
-  res.json({
-    success: true, version: VERSION, tz: TZ, SRC_SHIFT_MIN, START_ADJUST_MIN,
-    nowUtc: new Date().toISOString(), nowCairo: fmtClock12(Date.now()), sample: lastRaw
-  });
+  res.json({ success: true, version: VERSION, tz: TZ, SRC_SHIFT_MIN, START_ADJUST_MIN, nowUtc: new Date().toISOString(), nowCairo: fmtClock12(Date.now()), sample: lastRaw });
+});
+
+// ===== Syria Player test =====
+app.get('/api/syria/test', async (req, res) => {
+  const url = String(req.query.url || '');
+  if (!isSyriaUrl(url)) return res.status(400).json({ success: false, error: 'not a syria url' });
+  try {
+    const t = syriaTarget(url);
+    const hdr = syriaHeaders(t.origin);
+    const master = await axios.get(t.masterUrl, { headers: hdr, timeout: 15000, responseType: 'text', validateStatus: () => true });
+    const body = String(master.data || '');
+    const firstVar = (body.split(/\r?\n/).find(l => l && !l.startsWith('#')) || '').trim();
+    let segStatus = null, segBytes = 0, segErr = null;
+    if (firstVar) {
+      const varUrl = new URL(firstVar, t.masterUrl).href;
+      const v = await axios.get(varUrl, { headers: hdr, timeout: 15000, responseType: 'text', validateStatus: () => true });
+      const vbody = String(v.data || '');
+      const firstSeg = (vbody.split(/\r?\n/).find(l => l && !l.startsWith('#')) || '').trim();
+      if (firstSeg) { const segUrl = new URL(firstSeg, varUrl).href; const s = await axios.get(segUrl, { headers: hdr, timeout: 15000, responseType: 'arraybuffer', validateStatus: () => true }); segStatus = s.status; segBytes = s.data?.byteLength || 0; }
+    }
+    res.json({ success: true, origin: t.origin, master: t.masterUrl, masterStatus: master.status, isM3u8: body.trim().startsWith('#EXTM3U'), firstVariant: firstVar, segment: { status: segStatus, bytes: segBytes, error: segErr }, snippet: body.slice(0, 500) });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
 });
 
 // ===== Push =====
-app.get('/api/push/vapid', (req, res) => {
-  res.json({ success: true, publicKey: VAPID.publicKey, source: VAPID.source });
-});
-
+app.get('/api/push/vapid', (req, res) => res.json({ success: true, publicKey: VAPID.publicKey, source: VAPID.source }));
 const subscribeHandler = (req, res) => {
   try {
     const e = upsertSub(req.body || {});
     if (!e) return res.status(400).json({ success: false, error: 'subscription required' });
     res.json({ success: true, subscribers: pushSubs.size, teams: e.teams.length, matches: e.matches.length, prefs: e.prefs });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
+  } catch (err) { res.status(500).json({ success: false, error: err.message }); }
 };
 app.post('/api/push/subscribe', subscribeHandler);
 app.post('/api/push/sync', subscribeHandler);
-
-app.post('/api/push/unsubscribe', (req, res) => {
-  const { endpoint } = req.body || {};
-  if (endpoint) { pushSubs.delete(endpoint); saveSubs(); }
-  res.json({ success: true });
-});
-
-app.get('/api/push/status', (req, res) => {
-  res.json({
-    success: true, subscribers: pushSubs.size, vapidConfigured: !!VAPID.publicKey,
-    vapidSource: VAPID.source, vapidStable: VAPID.source !== 'generated', publicKey: VAPID.publicKey
-  });
-});
-
-// إشعار تجربة فورًا
+app.post('/api/push/unsubscribe', (req, res) => { const { endpoint } = req.body || {}; if (endpoint) { pushSubs.delete(endpoint); saveSubs(); } res.json({ success: true }); });
+app.get('/api/push/status', (req, res) => { res.json({ success: true, subscribers: pushSubs.size, vapidConfigured: !!VAPID.publicKey, vapidSource: VAPID.source, vapidStable: VAPID.source !== 'generated', publicKey: VAPID.publicKey }); });
 app.post('/api/push/test', async (req, res) => {
   try {
     const { subscription } = req.body || {};
-    const payload = {
-      title: '⚽ كورة لايف', body: 'تم تفعيل الإشعارات بنجاح — هنبعتلك عند الجول',
-      tag: 'test-koora', data: { test: true, url: '' }
-    };
-    if (subscription && subscription.endpoint) {
-      await webpush.sendNotification(subscription, JSON.stringify(payload), { TTL: 60, urgency: 'high' });
-      if (!pushSubs.has(subscription.endpoint)) upsertSub({ subscription });
-      return res.json({ success: true, sent: 1, mode: 'direct' });
-    }
+    const payload = { title: '⚽ كورة لايف', body: 'تم تفعيل الإشعارات بنجاح', tag: 'test-koora', data: { test: true, url: '' } };
+    if (subscription && subscription.endpoint) { await webpush.sendNotification(subscription, JSON.stringify(payload), { TTL: 60, urgency: 'high' }); if (!pushSubs.has(subscription.endpoint)) upsertSub({ subscription }); return res.json({ success: true, sent: 1, mode: 'direct' }); }
     const sent = await pushMany([...pushSubs.values()], payload, 60);
     res.json({ success: true, sent, mode: 'broadcast', subscribers: pushSubs.size });
-  } catch (e) {
-    console.error('[Push test]', e.statusCode, e.body || e.message);
-    res.status(500).json({ success: false, error: e.message, statusCode: e.statusCode || null, body: e.body || null });
-  }
+  } catch (e) { console.error('[Push test]', e.statusCode, e.body || e.message); res.status(500).json({ success: false, error: e.message, statusCode: e.statusCode || null, body: e.body || null }); }
 });
 
 app.post('/api/refresh', async (req, res) => {
-  try {
-    const data = await fetchMatches();
-    io.emit('matches', data);
-    res.json({ success: true, ...data });
-  } catch (e) {
-    res.status(500).json({ success: false, error: e.message });
-  }
+  try { const data = await fetchMatches(); io.emit('matches', data); res.json({ success: true, ...data }); }
+  catch (e) { res.status(500).json({ success: false, error: e.message }); }
 });
 
+// ===== Stream =====
 app.get('/api/stream', async (req, res) => {
   const link = req.query.link || (req.query.key ? 'key:' + req.query.key : '');
   if (!link) return res.status(400).json({ success: false, error: 'link or key required' });
   const ctx = {};
   const mlink = decodeURIComponent(link);
+
+  // === Syria Player direct ===
+  if (isSyriaUrl(mlink)) {
+    try {
+      const t = syriaTarget(mlink);
+      const hdr = syriaHeaders(t.origin);
+      const r = await axios.get(t.masterUrl, { headers: hdr, timeout: 15000, responseType: 'text', validateStatus: () => true });
+      if (r.status >= 400) throw new Error('syria master HTTP ' + r.status);
+      const body = String(r.data || '');
+      if (!body.trim().startsWith('#EXTM3U')) throw new Error('syria: not m3u8');
+      const host0 = `${req.protocol}://${req.get('host')}`;
+      const refQ = '&syr=1&base=' + encodeURIComponent(t.base + t.path);
+      const lines = body.split(/\r?\n/);
+      const qualities = [];
+      for (let i = 0; i < lines.length; i++) {
+        const ln = lines[i].trim();
+        if (!ln.startsWith('#EXT-X-STREAM-INF')) continue;
+        const bw = (ln.match(/BANDWIDTH=(\d+)/) || [])[1];
+        const reso = (ln.match(/RESOLUTION=(\d+x\d+)/) || [])[1] || '';
+        let nxt = '';
+        for (let j = i + 1; j < lines.length; j++) { if (lines[j].trim() && !lines[j].startsWith('#')) { nxt = lines[j].trim(); break; } }
+        if (!nxt) continue;
+        const abs = new URL(nxt, t.masterUrl).href;
+        qualities.push({ label: reso || (bw ? Math.round(+bw / 1000) + 'k' : 'HD'), url: `${host0}/proxy?url=${encodeURIComponent(abs)}${refQ}` });
+      }
+      const playUrl = qualities[0] ? qualities[0].url : `${host0}/proxy?url=${encodeURIComponent(t.masterUrl)}${refQ}`;
+      return res.json({ success: true, playUrl, qualities, quality: qualities[0]?.label || 'HD', type: 'hls', proxied: true, manual: true, provider: 'syria-player', sourceUrl: t.masterUrl, resolvedAt: new Date().toISOString() });
+    } catch (e) {
+      console.error('[Syria]', e.message);
+      return res.status(502).json({ success: false, error: 'syria: ' + e.message });
+    }
+  }
+
   const man = manualFor(req.query.key ? String(req.query.key) : null, mlink);
   if (man && man.sources && man.sources.length) {
     const host0 = `${req.protocol}://${req.get('host')}`, sk = safeKey(man.key);
@@ -2680,21 +2243,14 @@ app.get('/api/stream', async (req, res) => {
     return res.json({ success: true, playUrl: qs[0].url, qualities: qs, quality: qs[0].label, type: 'hls', proxied: man.mode !== 'direct', manual: true, embedUrl: man.embed || null, resolvedAt: new Date().toISOString() });
   }
   if (man && man.embed) return res.json({ success: true, type: 'iframe', embedUrl: man.embed, manual: true });
-  const idm = mlink.match(/[?&]m=(\d+)/);
   const fallbackEmbed = () => ctx.embed || null;
   try {
     const result = await resolveStream(mlink, ctx);
     const host = `${req.protocol}://${req.get('host')}`;
     const ref = encodeURIComponent(result.referer || '');
-    const qualities = (result.qualities || []).map(q => ({
-      label: q.label,
-      url: `${host}/proxy?url=${encodeURIComponent(q.url)}&ref=${ref}`
-    }));
+    const qualities = (result.qualities || []).map(q => ({ label: q.label, url: `${host}/proxy?url=${encodeURIComponent(q.url)}&ref=${ref}` }));
     const playUrl = `${host}/proxy?url=${encodeURIComponent(result.streamUrl)}&ref=${ref}`;
-    res.json({
-      success: true, playUrl, qualities, quality: result.quality,
-      type: 'hls', proxied: true, resolvedAt: result.resolvedAt, embedUrl: result.embed || fallbackEmbed()
-    });
+    res.json({ success: true, playUrl, qualities, quality: result.quality, type: 'hls', proxied: true, resolvedAt: result.resolvedAt, embedUrl: result.embed || fallbackEmbed() });
   } catch (e) {
     console.error('[Stream]', e.message);
     const emb = fallbackEmbed();
@@ -2706,41 +2262,30 @@ app.get('/api/stream', async (req, res) => {
 app.get('/proxy', async (req, res) => {
   const target = req.query.url;
   if (!target) return res.status(400).send('url required');
-  // Express decodes query parameters automatically; don't decode target again,
-  // otherwise escaped characters inside the source URL can be corrupted.
   await proxyHls(req, res, target, req.query.ref || null);
 });
 
 app.get('/health', (req, res) => {
-  res.json({
-    status: 'ok', version: '5.2', uptime: process.uptime(),
-    lastUpdate: cache.lastUpdate, counts: cache.counts,
-    caches: { details: detailsCache.size, streams: streamCache.size }
-  });
+  res.json({ status: 'ok', version: VERSION, uptime: process.uptime(), lastUpdate: cache.lastUpdate, counts: cache.counts, caches: { details: detailsCache.size, streams: streamCache.size } });
 });
 
 app.get('/', (req, res) => {
   res.json({
-    name: 'Sir TV Live Server', version: '5.3', status: 'running',
-    features: ['news', 'highlights', 'match-extras', 'player', 'league-follow', 'matches', 'leagues', 'standings', 'scorers', 'fixtures', 'push-notifications', 'rich-details-fotmob', 'broadcast-metadata', 'league-groups', 'full-hls-proxy', 'team-follow', 'ranks', 'time-fix'],
+    name: 'Sir TV Live Server', version: VERSION, status: 'running',
+    features: ['news', 'highlights', 'match-extras', 'player', 'league-follow', 'matches', 'leagues', 'standings', 'scorers', 'fixtures', 'push-notifications', 'rich-details-fotmob', 'broadcast-metadata', 'league-groups', 'full-hls-proxy', 'team-follow', 'ranks', 'time-fix', 'syria-player'],
     endpoints: {
       matches: 'GET /api/matches',
       leagues: 'GET /api/leagues',
       league: 'GET /api/league/:id',
-      leagueGroups: 'GET /api/league/:id/groups',
-      stream: 'GET /api/stream?link=  (type=hls أو iframe احتياطي)',
+      stream: 'GET /api/stream?link=  (type=hls أو iframe)',
       details: 'GET /api/match/details?link=&id=&home=&away=',
       health: 'GET /health',
-      ranks: 'GET /api/ranks',
-      teamSearch: 'GET /api/teams/search?q=',
-      team: 'GET /api/team/:id',
+      syriaTest: 'GET /api/syria/test?url=https://1cdn.syria-player.info/bein1',
       news: 'GET /api/news?topics=a|b',
-      newsStatus: 'GET /api/news/status',
       article: 'GET /api/article?url=',
       highlights: 'GET /api/highlights?q=',
       extras: 'GET /api/match/extras?home=&away=&link=',
-      player: 'GET /api/player/:id',
-      debugTime: 'GET /api/debug/time'
+      player: 'GET /api/player/:id'
     }
   });
 });
@@ -2757,7 +2302,7 @@ setInterval(() => {
 
 async function boot() {
   await fetchMatches();
-  seedSnapshot(cache.matches);           // نزرع الحالة الحالية من غير ما نبعت إشعارات
+  seedSnapshot(cache.matches);
   io.emit('matches', cache);
   buildTeamIndex(true).catch(e => console.error('[Index]', e.message));
   setInterval(async () => {
@@ -2767,11 +2312,13 @@ async function boot() {
   }, 20000);
   setInterval(() => buildTeamIndex().catch(() => {}), 5 * 60 * 1000);
 }
-
 boot().catch(console.error);
+
+setInterval(loadManualFromFirebase, 30 * 1000);
+loadManualFromFirebase();
 
 server.listen(PORT, () => {
   console.log(`\n🔥 Sir TV Live v${VERSION} — port ${PORT}`);
   console.log(`   TZ=${TZ} SRC_SHIFT_MIN=${SRC_SHIFT_MIN} | VAPID=${VAPID.source}`);
-  console.log(`   Time fix | Ranks | Team follow | Rich details | Push\n`);
+  console.log(`   Syria Player support: ON\n`);
 });
