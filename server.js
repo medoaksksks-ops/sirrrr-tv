@@ -94,7 +94,7 @@ const io = new Server(server, { cors: { origin: true }, pingInterval: 20000, pin
 let cache = {
   matches: [], live: [], finished: [], upcoming: [],
   counts: { total: 0, live: 0, finished: 0, upcoming: 0 },
-  lastUpdate: null, error: null, version: '5.2'
+  lastUpdate: null, error: null, version: '5.3',
 };
 
 const detailsCache = new Map();
@@ -117,7 +117,7 @@ function to12Hour(timeStr) {
 }
 
 // ========== TIME (Africa/Cairo) ==========
-const VERSION = '5.2';
+const VERSION = '5.3';
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch (_) {}
 const envNum = (k, d) => { const v = process.env[k]; if (v === undefined || v === '') return d; const n = Number(v); return Number.isFinite(n) ? n : d; };
@@ -264,6 +264,7 @@ async function fetchMatches() {
       else if (/انتهت|انتهى|ft|نهاية/.test(s)) statusType = 'finished';
 
       const hasStream = !!(link && (link.includes('korat') || link.includes('hes-goals') || /[?&]m=\d+/.test(link) || link.includes('watch-')));
+      const cardBroadcast = broadcastMetaFromHtml($el.html());
 
       // الوقت: نصحّحه ونحوله لتوقيت القاهرة
       const st = parseStart(startAttr, timeRaw, statusType);
@@ -282,6 +283,9 @@ async function fetchMatches() {
           start: startMs ? new Date(startMs).toISOString() : null,
           startMs: startMs || null,
           startHow: st ? st.how : null,
+          channel: cardBroadcast.channel || null,
+          commentator: cardBroadcast.commentator || null,
+          commentatorPhoto: cardBroadcast.commentatorPhoto || null,
           link, hasStream
         });
         if (raw.length < 15) raw.push({ home, away, timeRaw, startAttr, how: st ? st.how : null, startIso: startMs ? new Date(startMs).toISOString() : null, cairo: startMs ? fmtClock12(startMs) : null });
@@ -323,6 +327,7 @@ function emptyDetails() {
     stats: [],
     info: {},
     formations: {},
+    broadcast: { channel: null, commentator: null, commentatorPhoto: null, source: null },
     source: null,
     updatedAt: null
   };
@@ -996,6 +1001,53 @@ function teamSummary(t) {
   };
 }
 
+
+// ========== BROADCAST / COMMENTATOR METADATA ==========
+function findDeepValue(root, keys, depth = 0, seen = new Set()) {
+  if (!root || typeof root !== 'object' || depth > 7 || seen.has(root)) return null;
+  seen.add(root);
+  if (Array.isArray(root)) {
+    for (const item of root) { const v = findDeepValue(item, keys, depth + 1, seen); if (v) return v; }
+    return null;
+  }
+  for (const [k, v] of Object.entries(root)) {
+    if (keys.test(k) && v != null && (typeof v === 'string' || typeof v === 'number')) {
+      const value = String(v).trim();
+      if (value && value.length < 180) return value;
+    }
+  }
+  for (const v of Object.values(root)) {
+    const found = findDeepValue(v, keys, depth + 1, seen);
+    if (found) return found;
+  }
+  return null;
+}
+function broadcastMetaFromData(data) {
+  const root = data?.content || data || {};
+  const channel = findDeepValue(root, /^(tv|tvchannel|tv_channel|broadcast|broadcaster|channel|channelname|broadcastchannel|television)$/i);
+  const commentator = findDeepValue(root, /^(commentator|commentary|commentatorname|commentaryby|announcer|narrator)$/i);
+  const commentatorPhoto = findDeepValue(root, /^(commentatorphoto|commentatorimage|commentaryphoto|announcerphoto|announcerimage)$/i);
+  return { channel: channel || null, commentator: commentator || null, commentatorPhoto: commentatorPhoto || null };
+}
+function broadcastMetaFromHtml(html) {
+  const $ = cheerio.load(html || '');
+  const text = $('body').text().replace(/\s+/g, ' ').trim();
+  const getLabel = (labels) => {
+    for (const label of labels) {
+      const escaped = label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const m = text.match(new RegExp(`${escaped}\\s*[:：-]?\\s*([^|•،,]{2,90})`, 'i'));
+      if (m) return m[1].trim();
+    }
+    return null;
+  };
+  const image = $('img').filter((_, el) => /معلق|commentator|announcer/i.test(`${$(el).attr('alt') || ''} ${$(el).attr('title') || ''}`)).first();
+  return {
+    channel: getLabel(['القناة الناقلة', 'القناة', 'Channel', 'TV channel', 'Broadcast']),
+    commentator: getLabel(['المعلق', 'التعليق الصوتي', 'Commentator', 'Commentary']),
+    commentatorPhoto: image.length ? new URL(image.attr('src'), SOURCE).href : null
+  };
+}
+
 async function enrichFromFotmob(details, home, away, startIso) {
   const rm = await resolveFotmobMatch({ home, away, startMs: startIso ? Date.parse(startIso) : null });
   const matchId = rm && rm.fmId;
@@ -1008,6 +1060,8 @@ async function enrichFromFotmob(details, home, away, startIso) {
   details.fotmobId = matchId;
 
   const content = data.content;
+  const broadcastMeta = broadcastMetaFromData(data);
+  details.broadcast = { ...broadcastMeta, source: (broadcastMeta.channel || broadcastMeta.commentator) ? 'fotmob' : null };
   const infoBox = (content.matchFacts && content.matchFacts.infoBox) || {};
   const stadium = infoBox.Stadium || {};
   const referee = infoBox.Referee || {};
@@ -1180,7 +1234,13 @@ async function enrichFromSportScore(details, home, away) {
 async function trySirTvPage(url, details) {
   try {
     const { data } = await get(url, { headers: { Referer: SOURCE } }, 0);
-    const $ = cheerio.load(data);
+    const meta = broadcastMetaFromHtml(data);
+    details.broadcast = {
+      channel: details.broadcast?.channel || meta.channel || null,
+      commentator: details.broadcast?.commentator || meta.commentator || null,
+      commentatorPhoto: details.broadcast?.commentatorPhoto || meta.commentatorPhoto || null,
+      source: (details.broadcast?.channel || details.broadcast?.commentator || meta.channel || meta.commentator) ? 'sir-tv' : null
+    };
     if (!details.source) details.source = 'sir-tv';
   } catch (_) {}
 }
@@ -2363,6 +2423,23 @@ app.get('/api/leagues', (req, res) => {
   });
 });
 // تفاصيل دوري: ترتيب + هدافين + مباريات
+app.get('/api/league/:id/groups', async (req, res) => {
+  try {
+    const data = await fetchLeagueDetails(req.params.id);
+    res.json({
+      success: true,
+      league: { id: data.id, name: data.name, nameAr: data.nameAr, season: data.season, type: data.type },
+      groups: Array.isArray(data.groups) && data.groups.length
+        ? data.groups
+        : (data.standings?.length ? [{ name: data.nameAr || data.name || 'الترتيب', standings: data.standings }] : []),
+      hasGroups: Array.isArray(data.groups) && data.groups.length > 1,
+      updatedAt: data.updatedAt
+    });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
 app.get('/api/league/:id', async (req, res) => {
   try {
     const data = await fetchLeagueDetails(req.params.id);
@@ -2644,12 +2721,13 @@ app.get('/health', (req, res) => {
 
 app.get('/', (req, res) => {
   res.json({
-    name: 'Sir TV Live Server', version: '5.2', status: 'running',
-    features: ['news', 'highlights', 'match-extras', 'player', 'league-follow', 'matches', 'leagues', 'standings', 'scorers', 'fixtures', 'push-notifications', 'rich-details-fotmob', 'full-hls-proxy', 'team-follow', 'ranks', 'time-fix'],
+    name: 'Sir TV Live Server', version: '5.3', status: 'running',
+    features: ['news', 'highlights', 'match-extras', 'player', 'league-follow', 'matches', 'leagues', 'standings', 'scorers', 'fixtures', 'push-notifications', 'rich-details-fotmob', 'broadcast-metadata', 'league-groups', 'full-hls-proxy', 'team-follow', 'ranks', 'time-fix'],
     endpoints: {
       matches: 'GET /api/matches',
       leagues: 'GET /api/leagues',
       league: 'GET /api/league/:id',
+      leagueGroups: 'GET /api/league/:id/groups',
       stream: 'GET /api/stream?link=  (type=hls أو iframe احتياطي)',
       details: 'GET /api/match/details?link=&id=&home=&away=',
       health: 'GET /health',
