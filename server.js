@@ -162,7 +162,7 @@ function to12Hour(timeStr) {
 }
 
 // ========== TIME (Africa/Cairo) ==========
-const VERSION = '6.1-koora';
+const VERSION = '6.2-koora';
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch (_) {}
 const envNum = (k, d) => { const v = process.env[k]; if (v === undefined || v === '') return d; const n = Number(v); return Number.isFinite(n) ? n : d; };
@@ -2029,13 +2029,14 @@ const LEAGUES = [
   }
 })();
 
-function mapTableRows(rows) {
+function mapTableRows(rows, groupName) {
   if (!Array.isArray(rows)) return [];
   return rows.map(r => ({
     rank: r.idx ?? r.rank ?? null,
     id: r.id,
     name: r.name,
     shortName: r.shortName || r.name,
+    nameAr: trAr(r.name),
     played: r.played,
     wins: r.wins,
     draws: r.draws,
@@ -2043,11 +2044,70 @@ function mapTableRows(rows) {
     goalsFor: r.scoresStr ? Number(String(r.scoresStr).split('-')[0]) : null,
     goalsAgainst: r.scoresStr ? Number(String(r.scoresStr).split('-')[1]) : null,
     goalsStr: r.scoresStr || null,
-    goalDiff: r.goalConDiff ?? null,
+    goalDiff: r.goalConDiff ?? r.goalDiff ?? null,
     pts: r.pts,
     qualColor: r.qualColor || null,
+    group: groupName || null,
     logo: r.id ? `https://images.fotmob.com/image_resources/logo/teamlogo/${r.id}_small.png` : null
-  }));
+  })).filter(r => r.id || r.name);
+}
+/** تطبيع اسم المجموعة: Group A / Grp. B → المجموعة A */
+function normalizeGroupName(name, index) {
+  const s = String(name || '').trim();
+  if (!s) return `المجموعة ${String.fromCharCode(65 + (index || 0))}`;
+  const m = s.match(/(?:group|grp\.?|مجموعة|المجموعة)\s*([A-H1-8])/i);
+  if (m) return `المجموعة ${m[1].toUpperCase()}`;
+  if (/^[A-H]$/i.test(s)) return `المجموعة ${s.toUpperCase()}`;
+  // أسماء عربية جاهزة
+  if (/مجموعة|المجموعة/.test(s)) return s;
+  return s;
+}
+/** استخراج صفوف جدول من عقدة FotMob بأشكال مختلفة */
+function extractTableRows(node) {
+  if (!node || typeof node !== 'object') return [];
+  if (Array.isArray(node)) return node;
+  const t = node.table || node;
+  if (Array.isArray(t)) return t;
+  if (t && typeof t === 'object') {
+    if (Array.isArray(t.all)) return t.all;
+    if (Array.isArray(t.All)) return t.All;
+  }
+  return [];
+}
+/**
+ * يفك جداول الدوريات + بطولات المجموعات (CAF / UCL groups stage).
+ * FotMob بيرجع شكلين:
+ *  1) عادي: data.table.all
+ *  2) مجموعات (composite): data.tables[{ leagueName, table: { all } }]
+ */
+function parseLeagueTables(tableRoot) {
+  const groups = [];
+  if (!Array.isArray(tableRoot)) return groups;
+  for (const t0 of tableRoot) {
+    const td = (t0 && (t0.data || t0)) || {};
+    // شكل المجموعات المركّب
+    if (Array.isArray(td.tables) && td.tables.length) {
+      td.tables.forEach((g, i) => {
+        const gName = normalizeGroupName(g.leagueName || g.groupName || g.name || '', i);
+        const rows = mapTableRows(extractTableRows(g), gName);
+        if (rows.length) groups.push({ name: gName, nameEn: g.leagueName || g.groupName || null, standings: rows });
+      });
+      continue;
+    }
+    // شكل جدول واحد
+    const rows = mapTableRows(extractTableRows(td), null);
+    if (rows.length) {
+      const gName = td.leagueName || td.groupName || t0?.leagueName || null;
+      // لو الاسم فيه Group اعتبره مجموعة
+      const isGrp = gName && /group|grp\.?|مجموعة/i.test(gName);
+      groups.push({
+        name: isGrp ? normalizeGroupName(gName, groups.length) : (gName || null),
+        nameEn: gName || null,
+        standings: rows
+      });
+    }
+  }
+  return groups;
 }
 
 function mapFixtures(list) {
@@ -2166,9 +2226,16 @@ async function fetchLeagueDetails(leagueId) {
   }
 
   const hasTable = (d) => {
-    if (Array.isArray(d?.table) && d.table.length) return true;
-    if (Array.isArray(d?.overview?.table) && d.overview.table.length) return true;
-    return false;
+    const check = (root) => {
+      if (!Array.isArray(root) || !root.length) return false;
+      for (const t0 of root) {
+        const td = (t0 && (t0.data || t0)) || {};
+        if (Array.isArray(td.tables) && td.tables.length) return true;
+        if (extractTableRows(td).length) return true;
+      }
+      return false;
+    };
+    return check(d?.table) || check(d?.overview?.table);
   };
 
   // Keep latest season as primary; only borrow standings from previous season if empty
@@ -2184,27 +2251,27 @@ async function fetchLeagueDetails(leagueId) {
     }
   }
 
-  // table — support top-level table OR overview.table; multi-group tables
+  // table — دوري عادي أو مجموعات (CAF Confed / Champions / أي composite)
   let standings = [];
   let groups = [];
+  let isGroupStage = false;
   try {
     const tableSrc = standingsSource || data;
-    const tableRoot = (Array.isArray(tableSrc.table) && tableSrc.table.length)
+    let tableRoot = (Array.isArray(tableSrc.table) && tableSrc.table.length)
       ? tableSrc.table
       : (Array.isArray(tableSrc.overview?.table) ? tableSrc.overview.table : []);
-
-    for (const t0 of tableRoot) {
-      const td = t0?.data || t0 || {};
-      const rows = td?.table?.all || td?.table?.All || (Array.isArray(td?.table) ? td.table : []);
-      const mapped = mapTableRows(rows);
-      const groupName = td.leagueName || td.groupName || t0?.leagueName || null;
-      if (mapped.length) {
-        groups.push({ name: groupName, standings: mapped });
-        standings = standings.concat(mapped);
-      }
+    groups = parseLeagueTables(tableRoot);
+    // لو فاضي جرّب overview.table
+    if (!groups.length && Array.isArray(tableSrc.overview?.table)) {
+      groups = parseLeagueTables(tableSrc.overview.table);
     }
-    // if single group, keep flat standings; if multi, prefer first or all
-    if (groups.length === 1) standings = groups[0].standings;
+    isGroupStage = groups.length > 1 || groups.some(g => g.name && /مجموعة|group|grp/i.test(g.name));
+    standings = groups.flatMap(g => g.standings || []);
+    // دوري عادي بجدول واحد بدون اسم مجموعة → نفضّل flat
+    if (groups.length === 1 && !isGroupStage) {
+      standings = groups[0].standings;
+      // نحتفظ بالمجموعة كـ undefined للدوري العادي عشان الفرونت يعرض جدول واحد
+    }
   } catch (e) {
     console.error('[table parse]', e.message);
   }
@@ -2215,9 +2282,62 @@ async function fetchLeagueDetails(leagueId) {
     fixtures = mapFixtures(data.fixtures?.allMatches || []);
   } catch (_) {}
 
-  // scorers
-  let scorers = mapScorers(data.stats?.players || []);
-  const goalsBlock = (data.stats?.players || []).find(p => p.name === 'goals' || /top scorer/i.test(p.header || ''));
+  // scorers / assists — بعض البطولات (CAF) stats.players فاضي في الموسم الجديد
+  let playersStats = data.stats?.players || [];
+  if (!playersStats.length) {
+    // جرّب مواسم أقدم عندها إحصائيات
+    for (const season of seasons.slice(0, 4)) {
+      if (season === (data.details?.selectedSeason || latest)) continue;
+      try {
+        const ds = await fotmobGet(`https://www.fotmob.com/api/data/leagues?id=${id}&season=${encodeURIComponent(season)}`);
+        const ps = ds?.stats?.players || [];
+        if (ps.length) { playersStats = ps; break; }
+      } catch (_) {}
+    }
+  }
+  // مسار RelativePath من seasonStatLinks (data.fotmob.com)
+  if (!playersStats.length) {
+    try {
+      const links = data.stats?.seasonStatLinks || [];
+      for (const link of links.slice(0, 3)) {
+        const rel = link && link.RelativePath;
+        if (!rel) continue;
+        const urls = [
+          `https://data.fotmob.com/${rel}`,
+          `https://www.fotmob.com/api/data/${rel}`
+        ];
+        for (const u of urls) {
+          try {
+            const { data: raw } = await axios.get(u, {
+              headers: { 'User-Agent': UA, Accept: 'application/json', Referer: 'https://www.fotmob.com/' },
+              timeout: 12000, validateStatus: s => s < 500
+            });
+            if (!raw) continue;
+            // أشكال محتملة للرد
+            let list = [];
+            if (Array.isArray(raw)) list = raw;
+            else if (Array.isArray(raw.TopLists)) list = raw.TopLists;
+            else if (Array.isArray(raw.statsList)) list = raw.statsList;
+            else if (Array.isArray(raw.players)) list = raw.players;
+            if (list.length) {
+              // حوّل لشكل mapScorers لو لزم
+              const goalsLike = list.find(x => x && (x.name === 'goals' || /scorer|goals/i.test(x.header || x.Name || '')));
+              if (goalsLike) playersStats = list;
+              else {
+                // قائمة لاعبين مباشرة
+                playersStats = [{ name: 'goals', header: 'Top scorer', topThree: list.slice(0, 3), participant: list[0] }];
+              }
+              break;
+            }
+          } catch (_) {}
+        }
+        if (playersStats.length) break;
+      }
+    } catch (e) { console.error('[stats links]', e.message); }
+  }
+
+  let scorers = mapScorers(playersStats);
+  const goalsBlock = playersStats.find(p => p.name === 'goals' || /top scorer/i.test(p.header || ''));
   if (goalsBlock?.fetchAllUrl) {
     const full = await fetchFullScorers(goalsBlock.fetchAllUrl);
     if (full.length) scorers = full;
@@ -2225,7 +2345,7 @@ async function fetchLeagueDetails(leagueId) {
 
   // assists
   let assists = [];
-  const ass = (data.stats?.players || []).find(p => p.name === 'goal_assist' || /assist/i.test(p.header || ''));
+  const ass = playersStats.find(p => p.name === 'goal_assist' || /assist/i.test(p.header || ''));
   if (ass) {
     assists = (ass.topThree || []).map((p, i) => ({
       id: p.id,
@@ -2239,7 +2359,7 @@ async function fetchLeagueDetails(leagueId) {
     }));
   }
 
-  // v4.0: assists كاملة + ترتيب فريق اللاعب
+  // assists كاملة + ترتيب فريق اللاعب + اسم المجموعة
   try {
     if (ass && ass.fetchAllUrl) {
       const fa = await fetchFullScorers(ass.fetchAllUrl);
@@ -2247,12 +2367,25 @@ async function fetchLeagueDetails(leagueId) {
     }
     const amap = new Map(assists.map(a => [Number(a.id), a.assists]));
     const srow = new Map(standings.map(s => [Number(s.id), s]));
-    const enrichP = p => { const t = srow.get(Number(p.teamId)); p.teamNameAr = p.teamName ? trAr(p.teamName) : null; if (t) { p.teamRank = t.rank; p.teamPlayed = t.played; } };
+    const enrichP = p => {
+      const t = srow.get(Number(p.teamId));
+      p.teamNameAr = p.teamName ? trAr(p.teamName) : null;
+      if (t) {
+        p.teamRank = t.rank;
+        p.teamPlayed = t.played;
+        p.teamGroup = t.group || null;
+      }
+    };
     scorers.forEach(p => { if (amap.has(Number(p.id))) p.assists = amap.get(Number(p.id)); enrichP(p); });
     assists.forEach(enrichP);
   } catch (e) { console.error('[scorers enrich]', e.message); }
 
   const meta = LEAGUES.find(l => l.id === id) || {};
+  const leagueType = meta.type || (data.details && data.details.type) || 'league';
+  // بطولات المجموعات: رجّع groups حتى لو فرونت قديم يعتمد hasGroups
+  const groupsOut = (isGroupStage || groups.length > 1)
+    ? groups.map(g => ({ name: g.name, nameEn: g.nameEn || null, standings: g.standings }))
+    : undefined;
   const result = {
     id,
     name: data.details.name || meta.name,
@@ -2261,16 +2394,20 @@ async function fetchLeagueDetails(leagueId) {
     country: data.details.country || meta.country || null,
     season: data.details.selectedSeason || latest || null,
     standingsSeason: (standingsSource && standingsSource.details && standingsSource.details.selectedSeason) || standingsSeason || null,
-    type: meta.type || 'league',
+    type: leagueType,
+    format: isGroupStage ? 'groups' : (leagueType === 'cup' ? 'cup' : 'league'),
+    hasGroups: !!(groupsOut && groupsOut.length > 1),
     logo: `https://images.fotmob.com/image_resources/logo/leaguelogo/${id}.png`,
     standings,
-    groups: groups.length > 1 ? groups : undefined,
+    groups: groupsOut,
     scorers,
     assists,
     fixtures,
     counts: {
       teams: standings.length,
+      groups: groupsOut ? groupsOut.length : 0,
       scorers: scorers.length,
+      assists: assists.length,
       fixtures: fixtures.length
     },
     updatedAt: new Date().toISOString()
@@ -3129,13 +3266,18 @@ app.get('/api/leagues', (req, res) => {
 app.get('/api/league/:id/groups', async (req, res) => {
   try {
     const data = await fetchLeagueDetails(req.params.id);
+    const groups = Array.isArray(data.groups) && data.groups.length
+      ? data.groups
+      : (data.standings?.length ? [{ name: data.nameAr || data.name || 'الترتيب', standings: data.standings }] : []);
     res.json({
       success: true,
-      league: { id: data.id, name: data.name, nameAr: data.nameAr, season: data.season, type: data.type },
-      groups: Array.isArray(data.groups) && data.groups.length
-        ? data.groups
-        : (data.standings?.length ? [{ name: data.nameAr || data.name || 'الترتيب', standings: data.standings }] : []),
-      hasGroups: Array.isArray(data.groups) && data.groups.length > 1,
+      league: {
+        id: data.id, name: data.name, nameAr: data.nameAr, season: data.season,
+        type: data.type, format: data.format || null, hasGroups: !!data.hasGroups
+      },
+      groups,
+      hasGroups: groups.length > 1 || !!data.hasGroups,
+      counts: data.counts,
       updatedAt: data.updatedAt
     });
   } catch (e) {
