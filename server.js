@@ -232,11 +232,11 @@ function resolveImgSrc($img, base) {
   return src && !src.startsWith('data:') ? src : null;
 }
 
-function parseMtInfo($el) {
+function parseMtInfo($el, $) {
   // Kept for compatibility; live-tvhd uses AF_Footer structure instead
   const items = [];
   $el.find('.MT_Info li').each((_, li) => {
-    const t = cheerio(li).text().replace(/\s+/g, ' ').trim();
+    const t = $(li).text().replace(/\s+/g, ' ').trim();
     if (t) items.push(t);
   });
   let channel = null, commentator = null, competition = null;
@@ -246,22 +246,22 @@ function parseMtInfo($el) {
   return { channel, commentator, competition };
 }
 
-function parseLiveTvFooter($el) {
+function parseLiveTvFooter($el, $) {
   // live-tvhd: .AF_Footer .AF_EvInfo > span.mic / span.tv / span.cup
   let channel = null, commentator = null, competition = null;
   $el.find('.AF_EvInfo span.tv, .AF_Footer .tv').each((_, el) => {
-    const t = cheerio(el).text().replace(/\s+/g, ' ').trim().replace(/^[\s\u200b]*/, '');
+    const t = $(el).text().replace(/\s+/g, ' ').trim().replace(/^[\s\u200b]*/, '');
     // remove icon text if any
     const clean = t.replace(/^[^\u0600-\u06FFa-zA-Z0-9]+/, '').trim();
     if (clean && !/^غير معروف$/.test(clean)) channel = clean;
   });
   $el.find('.AF_EvInfo span.mic, .AF_Footer .mic').each((_, el) => {
-    const t = cheerio(el).text().replace(/\s+/g, ' ').trim();
+    const t = $(el).text().replace(/\s+/g, ' ').trim();
     const clean = t.replace(/^[^\u0600-\u06FFa-zA-Z0-9]+/, '').trim();
     if (clean && !/^غير معروف$/.test(clean)) commentator = clean;
   });
   $el.find('.AF_EvInfo span.cup, .AF_Footer .cup').each((_, el) => {
-    const t = cheerio(el).text().replace(/\s+/g, ' ').trim();
+    const t = $(el).text().replace(/\s+/g, ' ').trim();
     const clean = t.replace(/^[^\u0600-\u06FFa-zA-Z0-9]+/, '').trim();
     if (clean) competition = clean;
   });
@@ -285,7 +285,7 @@ function firstImage($el, selectors, baseUrl) {
   return null;
 }
 
-function parseMatchCard($el, baseUrl) {
+function parseMatchCard($el, baseUrl, $) {
   // Support both legacy selectors (fallback) and live-tvhd AF_* structure
   const isLiveTv = $el.hasClass('AF_Match') || $el.find('.AF_TeamName, .AF_FTeam, .AF_STeam').length > 0;
 
@@ -308,7 +308,7 @@ function parseMatchCard($el, baseUrl) {
     awayLogo = firstImage($el, ['.AF_STeam img', '.AF_Team.AF_STeam img', '.AF_Team2 img', '.away-team img', '.team-away img'], baseUrl);
 
     const results = $el.find('.AF_EventResult > span.result, span.result')
-      .map((_, s) => cheerio(s).text().trim()).get().filter(t => /^\d+$/.test(t));
+      .map((_, s) => $(s).text().trim()).get().filter(t => /^\d+$/.test(t));
     if (results.length >= 2) {
       homeScore = parseInt(results[0], 10);
       awayScore = parseInt(results[1], 10);
@@ -338,7 +338,7 @@ function parseMatchCard($el, baseUrl) {
     awayLogo = firstImage($el, ['.TM2 img', '.team-away img', '.away-team img', '.team2 img', '.away img'], baseUrl);
 
     const goalSpans = $el.find('.MT_Result .RS-goals, .MT_Result .goals')
-      .map((_, s) => cheerio(s).text().trim()).get().filter(t => /^\d+$/.test(t));
+      .map((_, s) => $(s).text().trim()).get().filter(t => /^\d+$/.test(t));
     if (goalSpans.length >= 2) {
       homeScore = parseInt(goalSpans[0], 10);
       awayScore = parseInt(goalSpans[1], 10);
@@ -376,12 +376,12 @@ function parseMatchCard($el, baseUrl) {
   // Broadcast meta
   let channel = null, commentator = null, competition = null;
   if (isLiveTv) {
-    const ft = parseLiveTvFooter($el);
+    const ft = parseLiveTvFooter($el, $);
     channel = normalizeChannel(ft.channel);
     commentator = ft.commentator;
     competition = ft.competition;
   } else {
-    const info = parseMtInfo($el);
+    const info = parseMtInfo($el, $);
     const cardBroadcast = typeof broadcastMetaFromHtml === 'function' ? broadcastMetaFromHtml($el.html()) : {};
     channel = normalizeChannel(info.channel || cardBroadcast.channel || null);
     commentator = info.commentator || cardBroadcast.commentator || null;
@@ -456,7 +456,7 @@ async function scrapeSource(url) {
   cards.each((_, el) => {
     if (seenNodes.has(el)) return;
     seenNodes.add(el);
-    const m = parseMatchCard($(el), finalUrl);
+    const m = parseMatchCard($(el), finalUrl, $);
     if (!m) return;
     matches.push(m);
     if (raw.length < 20) raw.push({
