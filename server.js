@@ -29,8 +29,8 @@ const app = express();
 const server = http.createServer(app);
 const PORT = process.env.PORT || 3000;
 // كل الإعدادات ثابتة جوه الكود — مش محتاج متغيرات Railway
-const SOURCE = 'https://live-tvhd.com/';
-const SOURCE_FALLBACK = process.env.SOURCE_FALLBACK || ''; // optional
+const SOURCE = (process.env.MATCHES_SOURCE || 'https://livetv-hd.com/').replace(/\/$/, '') + '/';
+const SOURCE_FALLBACK = (process.env.SOURCE_FALLBACK || '').trim().replace(/\/$/, ''); // optional
 const YALLA_PLAYER_BASE = 'https://yallamo.mom/albaplayer';
 const SHOOTSIMO_HOSTS = ['goodboy.shootsimo.com', 'badboy.shootsimo.com', '2.shootsimo.net'];
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36';
@@ -68,8 +68,10 @@ const httpClient = axios.create({
   validateStatus: s => s < 500,
   headers: {
     'User-Agent': UA,
-    'Accept-Language': 'ar,en;q=0.9',
-    Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+    'Accept-Language': 'ar,en-US;q=0.9,en;q=0.8',
+    Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+    'Cache-Control': 'no-cache',
+    Pragma: 'no-cache'
   }
 });
 
@@ -217,6 +219,7 @@ function parseStart(attr, timeRaw, statusType) {
 // ========== MATCHES SCRAPER (live-tvhd.com / livetv-hd.com) ==========
 let lastRaw = [];
 let lastScrapeError = null;
+let lastSourceDiagnostics = { requestedUrl: SOURCE, finalUrl: null, httpStatus: null, title: null, cardCount: 0, parsedCount: 0, fetchedAt: null };
 let scrapingLock = false;
 
 function resolveImgSrc($img, base) {
@@ -265,9 +268,26 @@ function parseLiveTvFooter($el) {
   return { channel, commentator, competition };
 }
 
+function firstText($el, selectors) {
+  for (const selector of selectors) {
+    const value = $el.find(selector).first().text().replace(/\s+/g, ' ').trim();
+    if (value) return value;
+  }
+  return '';
+}
+
+function firstImage($el, selectors, baseUrl) {
+  for (const selector of selectors) {
+    const $img = $el.find(selector).first();
+    const value = resolveImgSrc($img, baseUrl);
+    if (value) return value;
+  }
+  return null;
+}
+
 function parseMatchCard($el, baseUrl) {
   // Support both legacy selectors (fallback) and live-tvhd AF_* structure
-  const isLiveTv = $el.hasClass('AF_Match') || $el.find('.AF_TeamName').length > 0;
+  const isLiveTv = $el.hasClass('AF_Match') || $el.find('.AF_TeamName, .AF_FTeam, .AF_STeam').length > 0;
 
   let home, away, homeLogo, awayLogo, link, statusText, timeRaw, dataTs, startAttr;
   let homeScore = null, awayScore = null, score = 'vs';
@@ -282,10 +302,10 @@ function parseMatchCard($el, baseUrl) {
       try { link = new URL(link, baseUrl).href; } catch (_) {}
     }
 
-    home = $el.find('.AF_FTeam .AF_TeamName, .AF_Team.AF_FTeam .AF_TeamName').first().text().replace(/\s+/g, ' ').trim();
-    away = $el.find('.AF_STeam .AF_TeamName, .AF_Team.AF_STeam .AF_TeamName').first().text().replace(/\s+/g, ' ').trim();
-    homeLogo = resolveImgSrc($el.find('.AF_FTeam img, .AF_Team.AF_FTeam img').first(), baseUrl);
-    awayLogo = resolveImgSrc($el.find('.AF_STeam img, .AF_Team.AF_STeam img').first(), baseUrl);
+    home = firstText($el, ['.AF_FTeam .AF_TeamName', '.AF_Team.AF_FTeam .AF_TeamName', '.AF_FTeam', '.AF_Team1 .AF_TeamName', '.home-team .team-name', '.team-home .team-name']);
+    away = firstText($el, ['.AF_STeam .AF_TeamName', '.AF_Team.AF_STeam .AF_TeamName', '.AF_STeam', '.AF_Team2 .AF_TeamName', '.away-team .team-name', '.team-away .team-name']);
+    homeLogo = firstImage($el, ['.AF_FTeam img', '.AF_Team.AF_FTeam img', '.AF_Team1 img', '.home-team img', '.team-home img'], baseUrl);
+    awayLogo = firstImage($el, ['.AF_STeam img', '.AF_Team.AF_STeam img', '.AF_Team2 img', '.away-team img', '.team-away img'], baseUrl);
 
     const results = $el.find('.AF_EventResult > span.result, span.result')
       .map((_, s) => cheerio(s).text().trim()).get().filter(t => /^\d+$/.test(t));
@@ -295,8 +315,8 @@ function parseMatchCard($el, baseUrl) {
       score = `${homeScore}-${awayScore}`;
     }
 
-    statusText = $el.find('.AF_StaText, .AF_Timer').first().text().replace(/\s+/g, ' ').trim();
-    timeRaw = $el.find('.AF_EvTime').first().text().replace(/\s+/g, ' ').trim();
+    statusText = firstText($el, ['.AF_StaText', '.AF_Timer', '.match-status', '.status', '.event-status']);
+    timeRaw = firstText($el, ['.AF_EvTime', '.match-time', '.event-time', '.time']);
     dataTs = null;
     startAttr = $el.attr('data-start') || null;
 
@@ -312,10 +332,10 @@ function parseMatchCard($el, baseUrl) {
     if (link && !link.startsWith('http')) {
       try { link = new URL(link, baseUrl).href; } catch (_) {}
     }
-    home = $el.find('.TM1 .TM_Name').text().trim();
-    away = $el.find('.TM2 .TM_Name').text().trim();
-    homeLogo = resolveImgSrc($el.find('.TM1 img').first(), baseUrl);
-    awayLogo = resolveImgSrc($el.find('.TM2 img').first(), baseUrl);
+    home = firstText($el, ['.TM1 .TM_Name', '.team-home .team-name', '.home-team .team-name', '.team1 .team-name', '.team1', '.home .team-name', '.home']);
+    away = firstText($el, ['.TM2 .TM_Name', '.team-away .team-name', '.away-team .team-name', '.team2 .team-name', '.team2', '.away .team-name', '.away']);
+    homeLogo = firstImage($el, ['.TM1 img', '.team-home img', '.home-team img', '.team1 img', '.home img'], baseUrl);
+    awayLogo = firstImage($el, ['.TM2 img', '.team-away img', '.away-team img', '.team2 img', '.away img'], baseUrl);
 
     const goalSpans = $el.find('.MT_Result .RS-goals, .MT_Result .goals')
       .map((_, s) => cheerio(s).text().trim()).get().filter(t => /^\d+$/.test(t));
@@ -333,8 +353,8 @@ function parseMatchCard($el, baseUrl) {
       } else if (rawS && !/^vs$/i.test(rawS)) score = rawS;
     }
 
-    statusText = $el.find('.MT_Stat').text().trim();
-    const $time = $el.find('.MT_Time').first();
+    statusText = firstText($el, ['.MT_Stat', '.match-status', '.status', '.event-status']);
+    const $time = $el.find('.MT_Time, .match-time, .event-time, .time').first();
     timeRaw = $time.text().trim();
     dataTs = $time.attr('data-ts') || $el.attr('data-ts') || null;
     startAttr = $el.attr('data-start') || null;
@@ -415,14 +435,28 @@ function parseMatchCard($el, baseUrl) {
 }
 
 async function scrapeSource(url) {
-  const { data } = await get(url, { headers: { Referer: url, 'Cache-Control': 'no-cache' } });
-  const $ = cheerio.load(data);
+  const { data, status, request } = await get(url, {
+    headers: {
+      Referer: url,
+      'Cache-Control': 'no-cache',
+      Pragma: 'no-cache',
+      'User-Agent': UA,
+      Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+    }
+  });
+  const html = String(data || '');
+  const finalUrl = request?.res?.responseUrl || request?._redirectable?._currentUrl || url;
+  const $ = cheerio.load(html);
   const matches = [];
   const raw = [];
-
-  // Primary: live-tvhd AF_Match cards
-  $('.AF_Match').each((_, el) => {
-    const m = parseMatchCard($(el), url);
+  const title = $('title').first().text().replace(/\s+/g, ' ').trim() || null;
+  const cardSelector = '.AF_Match, .AY_Match, .match-item, .match_item, .match-card, .Match, .match';
+  const cards = $(cardSelector);
+  const seenNodes = new Set();
+  cards.each((_, el) => {
+    if (seenNodes.has(el)) return;
+    seenNodes.add(el);
+    const m = parseMatchCard($(el), finalUrl);
     if (!m) return;
     matches.push(m);
     if (raw.length < 20) raw.push({
@@ -432,20 +466,13 @@ async function scrapeSource(url) {
     });
   });
 
-  // Fallback legacy selectors if no AF_Match found
-  if (!matches.length) {
-    $('.AY_Match, .match-item, .match_item').each((_, el) => {
-      const m = parseMatchCard($(el), url);
-      if (!m) return;
-      matches.push(m);
-      if (raw.length < 15) raw.push({
-        home: m.home, away: m.away, timeRaw: m.timeRaw, startHow: m.startHow,
-        startIso: m.start, cairo: m.time, channel: m.channel, competition: m.competition
-      });
-    });
-  }
-
-  return { matches, raw, html: data };
+  lastSourceDiagnostics = {
+    requestedUrl: url, finalUrl, httpStatus: status, title,
+    cardCount: cards.length, parsedCount: matches.length,
+    htmlBytes: Buffer.byteLength(html, 'utf8'), fetchedAt: new Date().toISOString(),
+    renderedHint: /__NEXT_DATA__|__NUXT__|webpack|enable javascript/i.test(html) && !matches.length
+  };
+  return { matches, raw, html, diagnostics: lastSourceDiagnostics };
 }
 
 async function fetchMatches() {
@@ -456,32 +483,40 @@ async function fetchMatches() {
   scrapingLock = true;
   try {
     let matches = [], raw = [], used = SOURCE;
-    try {
-      const r = await scrapeSource(SOURCE);
-      matches = r.matches; raw = r.raw; used = SOURCE;
-      lastScrapeError = null;
-    } catch (e1) {
-      console.error('[Scraper primary]', e1.message);
-      lastScrapeError = e1.message;
-      if (SOURCE_FALLBACK && SOURCE_FALLBACK !== SOURCE) {
-        try {
-          const r2 = await scrapeSource(SOURCE_FALLBACK);
-          matches = r2.matches; raw = r2.raw; used = SOURCE_FALLBACK;
-          lastScrapeError = null;
-        } catch (e2) {
-          lastScrapeError = e2.message;
-          throw e1;
+    const sources = [SOURCE, ...(SOURCE_FALLBACK && SOURCE_FALLBACK.replace(/\/$/, '') !== SOURCE.replace(/\/$/, '') ? [SOURCE_FALLBACK] : [])];
+    let lastFailure = null;
+
+    for (const source of sources) {
+      try {
+        const result = await scrapeSource(source);
+        if (!result.matches.length) {
+          const d = result.diagnostics || {};
+          lastFailure = `No matches parsed from ${source} (HTTP ${d.httpStatus || 'unknown'}, cards=${d.cardCount || 0}, title=${d.title || 'unknown'})`;
+          console.warn('[Scraper] ' + lastFailure);
+          continue;
         }
-      } else {
-        // keep previous cache on temporary failure
-        if (cache.matches && cache.matches.length) {
-          console.warn('[Scraper] keep previous cache after error:', e1.message);
-          cache.error = e1.message;
-          cache.lastUpdate = new Date().toISOString();
-          return cache;
-        }
-        throw e1;
+        matches = result.matches;
+        raw = result.raw;
+        used = result.diagnostics?.finalUrl || source;
+        lastFailure = null;
+        break;
+      } catch (error) {
+        lastFailure = `${source}: ${error.message}`;
+        console.error('[Scraper source]', lastFailure);
       }
+    }
+
+    if (!matches.length) {
+      lastScrapeError = lastFailure || 'No matches found in configured sources';
+      cache.error = lastScrapeError;
+      // لا نمسح آخر قائمة سليمة بسبب تغيير HTML أو فشل مؤقت بالمصدر.
+      if (cache.matches && cache.matches.length) {
+        console.warn('[Scraper] keeping previous match cache');
+        return cache;
+      }
+      cache.lastUpdate = new Date().toISOString();
+      cache.source = used;
+      return cache;
     }
 
     // Deduplicate by teams + approximate start
@@ -494,6 +529,7 @@ async function fetchMatches() {
       return true;
     });
     lastRaw = raw;
+    lastScrapeError = null;
 
     const order = { live: 0, upcoming: 1, finished: 2 };
     matches.sort((a, b) => (order[a.statusType] ?? 3) - (order[b.statusType] ?? 3) || ((a.startMs || 0) - (b.startMs || 0)));
@@ -515,7 +551,6 @@ async function fetchMatches() {
     lastScrapeError = err.message;
     cache.error = err.message;
     cache.lastUpdate = new Date().toISOString();
-    // never return empty list if we had data
     return cache;
   } finally {
     scrapingLock = false;
@@ -3287,6 +3322,7 @@ app.get('/api/source-status', (req, res) => {
     source: c.source || SOURCE,
     sourcePrimary: SOURCE,
     sourceFallback: SOURCE_FALLBACK || null,
+    diagnostics: lastSourceDiagnostics,
     lastUpdate: c.lastUpdate || null,
     error: c.error || lastScrapeError || null,
     version: VERSION,
