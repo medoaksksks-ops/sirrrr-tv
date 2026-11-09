@@ -1,55 +1,19 @@
 /**
- * Sir TV Live Server v6.0-koora
+ * Sir TV Live Server v7.0-livetv
  * ------------------------------------------------------------
- * v6.0 (kooratv.quest):
- *  - المصدر الأساسي للمباريات: https://kooratv.quest (مع fallback على sir-tv.vip)
- *  - استخراج القناة الناقلة + المعلق + البطولة من .MT_Info على كروت المباريات
- *  - التوقيت من data-ts (epoch ms) مباشرة من kooratv — أدق من تصحيح الفرق
- *  - حل البث المتعدد السيرفرات عبر سلسلة:
- *      kooratv match page → yallamo.mom/albaplayer/sport-N → badboy/goodboy.shootsimo.com → m3u8
- *  - /api/stream بيرجّع servers[] مع playUrl لكل سيرفر + qualities + embed احتياطي
- *  - بروكسي HLS يدعم goodboy/badboy.shootsimo.com بنفس هيدرز المصدر
- *  - GET /api/coach/:teamId — بيانات المدرب + الطاقم + ترتيب الفريق (FotMob)
- *  - GET /api/transfers/:teamId — انتقالات الفريق (داخل/خارج)
- *  - GET /api/league/:id/transfers — تجميع انتقالات فرق الدوري
- *  - توسيع قائمة الدوريات (مؤتمر أوروبا، MLS، البرازيل، الأرجنتين، كؤوس...)
- *  - مصادر أخبار إضافية: سعودي / انتقالات / أبطال / أفريقيا
- *  - متغيرات: SOURCE_URL, SOURCE_FALLBACK, YALLA_PLAYER_BASE, SHOOTSIMO_HOSTS
- * v5.2:
- *  - الهيدرز ثابتة جوه السيرفر (Origin/Referer/UA/Accept/Cookie بتوع المصدر) — من اللوحة بتحط رابط البث بس
- *    وممكن تتغيّر من Railway: STREAM_REFERER / STREAM_ORIGIN / STREAM_UA / STREAM_COOKIE / STREAM_ACCEPT
- * v5.1:
- *  - الطلب للمصدر بيتبعت بنفس هيدرز المتصفح بالظبط: Origin / Referer / User-Agent / Accept / Accept-Encoding: identity / Cookie / Connection: keep-alive
- * v5.0:
- *  - نظام بث يدوي: لوحة تحكم (admin) بتحط رابط m3u8 لكل ماتش، بيتحفظ في Firebase
- *    والسيرفر بيشغّله عبر بروكسي بنفس Referer/Origin/User-Agent. متغيرات: ADMIN_PASSWORD, FIREBASE_DB_URL, FIREBASE_SECRET
- *    مسارات: /api/admin/{login,matches,stream,test} — و /api/stream بيدّي الأولوية للرابط اليدوي
- * v4.3:
- *  - GET /api/article?url= : قارئ مقالات جوه الموقع (بيفك روابط أخبار جوجل ويطلّع النص والصورة)
- * v4.2:
- *  - استخراج رابط البث أقوى: بيدوّر على playerv5.php?match=&key= (sirtv.top) حتى لو جوه JS/متشفّر (escaped / base64)
- *  - GET /api/debug/stream?link= : بيوريك السيرفر شاف إيه في كل خطوة (للتشخيص)
- *  - GET /embed?url= : بروكسي لصفحة المشغّل بـ Referer سير تي في (احتياطي للـ iframe)
- * v4.1:
- *  - البث: لو السيرفر مقدرش يطلع رابط HLS، /api/stream بيرجّع رابط الـ iframe (مشغّل المصدر)
- *    عشان الصفحة تشغّله بدل ما المباراة متشتغلش خالص (type:'iframe' + embedUrl)
- * v4.0:
- *  - أخبار كورة: GET /api/news (عام / topics=فريق|دوري) + /api/news/status لفحص المصادر
- *    (متغير NEWS_FEEDS = JSON لإضافة مصادر RSS)
- *  - ملخصات: GET /api/highlights?q= + ملخص الماتش الرسمي من FotMob
- *    (متغير HL_CHANNELS = channel_id[:اسم],... لقنوات يوتيوب مفضلة)
- *  - GET /api/match/extras : ملخص نصي تلقائي + فيديوهات + أخبار المباراة
- *  - GET /api/player/:id : بيانات اللاعب (مركز/سن/قيمة/إحصائيات/آخر المباريات)
- *  - الهدافين: assists + ترتيب فريق اللاعب
- *  - إشعارات: متابعة دوري كامل (leagues في الاشتراك)
- * v3.9:
- *  - توقيت المباريات: تصحيح فرق الساعتين + عرض بتوقيت القاهرة
- *      (SRC_SHIFT_MIN / START_ADJUST_MIN / DISPLAY_TZ من متغيرات Railway)
- *  - ترتيب الفريق في دوريه: /api/ranks + homeRank/awayRank داخل /api/matches
- *  - متابعة الفرق: /api/teams/search , /api/team/:id (المباراة الجاية + آخر النتائج)
- *  - تفاصيل أغنى: تبديلات / كروت / أهداف لكل لاعب + دكة البدلاء + أحداث كاملة
- *  - إشعارات: مفاتيح VAPID ثابتة، تذكير قبل المباراة، بداية، جول، نهاية
- *  - /api/debug/time لفحص الوقت الخام من المصدر
+ * v7.0 (live-tvhd.com / livetv-hd.com):
+ *  - المصدر الأساسي للمباريات: https://live-tvhd.com (livetv-hd.com يعيد التوجيه إليه)
+ *  - Parser مستقل لبنية AF_Match / AF_Team / AF_Footer الخاصة بالموقع
+ *  - استخراج: الفريقين + الشعارات + النتيجة + الحالة + التوقيت (data-start بتوقيت القاهرة)
+ *    + القناة الناقلة + المعلق + البطولة من .AF_EvInfo
+ *  - تقسيم تلقائي: live / upcoming / finished مع منع التكرار
+ *  - الحفاظ على جميع وظائف v6: FotMob، الأخبار، لوحة الإدارة، Firebase، Socket.IO،
+ *    نظام البث اليدوي/البروكسي، API teams/player/coach/transfers/news/extras...
+ *  - مسار تشخيص: GET /api/source-status
+ *  - لا استخراج لروابط بث مخفية أو DRM؛ الاعتماد على الروابط المعلنة + الروابط اليدوية من اللوحة
+ *  - Cache مستقر + تحديث دوري + عدم إرجاع قائمة فارغة عند فشل مؤقت
+ * ------------------------------------------------------------
+ * (الوظائف القديمة من v6 وما قبلها محفوظة بالكامل)
  */
 const express = require('express');
 const http = require('http');
@@ -65,8 +29,8 @@ const app = express();
 const server = http.createServer(app);
 const PORT = process.env.PORT || 3000;
 // كل الإعدادات ثابتة جوه الكود — مش محتاج متغيرات Railway
-const SOURCE = 'https://kooratv.quest/';
-const SOURCE_FALLBACK = 'https://sir-tv.vip/';
+const SOURCE = 'https://live-tvhd.com/';
+const SOURCE_FALLBACK = process.env.SOURCE_FALLBACK || ''; // optional
 const YALLA_PLAYER_BASE = 'https://yallamo.mom/albaplayer';
 const SHOOTSIMO_HOSTS = ['goodboy.shootsimo.com', 'badboy.shootsimo.com', '2.shootsimo.net'];
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36';
@@ -139,7 +103,7 @@ const io = new Server(server, { cors: { origin: true }, pingInterval: 20000, pin
 let cache = {
   matches: [], live: [], finished: [], upcoming: [],
   counts: { total: 0, live: 0, finished: 0, upcoming: 0 },
-  lastUpdate: null, error: null, version: '5.3',
+  lastUpdate: null, error: null, version: '7.0-livetv',
 };
 
 const detailsCache = new Map();
@@ -162,7 +126,7 @@ function to12Hour(timeStr) {
 }
 
 // ========== TIME (Africa/Cairo) ==========
-const VERSION = '6.2-koora';
+const VERSION = '7.0-livetv';
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch (_) {}
 const envNum = (k, d) => { const v = process.env[k]; if (v === undefined || v === '') return d; const n = Number(v); return Number.isFinite(n) ? n : d; };
@@ -250,8 +214,11 @@ function parseStart(attr, timeRaw, statusType) {
   }
   return { ms: pick, how: 'text+shift' };
 }
-// ========== MATCHES SCRAPER (kooratv.quest primary + sir-tv fallback) ==========
+// ========== MATCHES SCRAPER (live-tvhd.com / livetv-hd.com) ==========
 let lastRaw = [];
+let lastScrapeError = null;
+let scrapingLock = false;
+
 function resolveImgSrc($img, base) {
   if (!$img || !$img.length) return null;
   let src = $img.attr('data-src') || $img.attr('data-lazy-src') || $img.attr('src') || null;
@@ -261,102 +228,173 @@ function resolveImgSrc($img, base) {
   }
   return src && !src.startsWith('data:') ? src : null;
 }
+
 function parseMtInfo($el) {
+  // Kept for compatibility; live-tvhd uses AF_Footer structure instead
   const items = [];
   $el.find('.MT_Info li').each((_, li) => {
     const t = cheerio(li).text().replace(/\s+/g, ' ').trim();
     if (t) items.push(t);
   });
-  if (!items.length) {
-    $el.find('.MT_Info li span, .match-info li').each((_, s) => {
-      const t = cheerio(s).text().replace(/\s+/g, ' ').trim();
-      if (t) items.push(t);
-    });
-  }
-  // Typical order on kooratv: [channel, commentator, competition]
   let channel = null, commentator = null, competition = null;
   if (items.length >= 1) channel = items[0] && !/^غير معروف$/.test(items[0]) ? items[0] : null;
   if (items.length >= 2) commentator = items[1] && !/^غير معروف$/.test(items[1]) ? items[1] : null;
   if (items.length >= 3) competition = items[2] || null;
-  for (const it of items) {
-    if (/beIN|Sports?|On Sport|Al Kas|SSC|Abu Dhabi|الكأس|بين سبورت|أون|الجزيرة|Arryadia/i.test(it) && !channel) channel = it;
-    else if (/معلق|غير معروف/.test(it)) continue;
-    else if (!commentator && channel && it !== channel && it !== competition) commentator = /^غير معروف$/.test(it) ? null : it;
-  }
-  return { channel, commentator, competition, raw: items };
+  return { channel, commentator, competition };
 }
+
+function parseLiveTvFooter($el) {
+  // live-tvhd: .AF_Footer .AF_EvInfo > span.mic / span.tv / span.cup
+  let channel = null, commentator = null, competition = null;
+  $el.find('.AF_EvInfo span.tv, .AF_Footer .tv').each((_, el) => {
+    const t = cheerio(el).text().replace(/\s+/g, ' ').trim().replace(/^[\s\u200b]*/, '');
+    // remove icon text if any
+    const clean = t.replace(/^[^\u0600-\u06FFa-zA-Z0-9]+/, '').trim();
+    if (clean && !/^غير معروف$/.test(clean)) channel = clean;
+  });
+  $el.find('.AF_EvInfo span.mic, .AF_Footer .mic').each((_, el) => {
+    const t = cheerio(el).text().replace(/\s+/g, ' ').trim();
+    const clean = t.replace(/^[^\u0600-\u06FFa-zA-Z0-9]+/, '').trim();
+    if (clean && !/^غير معروف$/.test(clean)) commentator = clean;
+  });
+  $el.find('.AF_EvInfo span.cup, .AF_Footer .cup').each((_, el) => {
+    const t = cheerio(el).text().replace(/\s+/g, ' ').trim();
+    const clean = t.replace(/^[^\u0600-\u06FFa-zA-Z0-9]+/, '').trim();
+    if (clean) competition = clean;
+  });
+  return { channel, commentator, competition };
+}
+
 function parseMatchCard($el, baseUrl) {
-  const id = ($el.attr('id') || '').replace(/^m-/, '') || null;
-  let link = $el.find('a').attr('href') || null;
-  if (link && !link.startsWith('http')) {
-    try { link = new URL(link, baseUrl).href; } catch (_) {}
-  }
-  const home = $el.find('.TM1 .TM_Name').text().trim();
-  const away = $el.find('.TM2 .TM_Name').text().trim();
-  const homeLogo = resolveImgSrc($el.find('.TM1 img').first(), baseUrl);
-  const awayLogo = resolveImgSrc($el.find('.TM2 img').first(), baseUrl);
+  // Support both legacy selectors (fallback) and live-tvhd AF_* structure
+  const isLiveTv = $el.hasClass('AF_Match') || $el.find('.AF_TeamName').length > 0;
 
-  const goalSpans = $el.find('.MT_Result .RS-goals, .MT_Result .goals')
-    .map((_, s) => $(s).text().trim()).get().filter(t => /^\d+$/.test(t));
+  let home, away, homeLogo, awayLogo, link, statusText, timeRaw, dataTs, startAttr;
   let homeScore = null, awayScore = null, score = 'vs';
-  if (goalSpans.length >= 2) {
-    homeScore = parseInt(goalSpans[0], 10);
-    awayScore = parseInt(goalSpans[1], 10);
-    score = `${homeScore}-${awayScore}`;
-  } else {
-    const rawS = $el.find('.MT_Result').text().replace(/\s+/g, ' ').trim();
-    const mscore = rawS.match(/(\d+)\s*[-–:]\s*(\d+)/);
-    if (mscore) {
-      homeScore = parseInt(mscore[1], 10);
-      awayScore = parseInt(mscore[2], 10);
+  let externalId = null, id = null;
+
+  if (isLiveTv) {
+    // live-tvhd.com structure
+    id = ($el.find('.AF_StaText').attr('id') || '').replace(/^gmDate/, '') || null;
+    const $a = $el.find('a[href*="/matches/"]').first();
+    link = $a.attr('href') || $el.find('a').attr('href') || null;
+    if (link && !link.startsWith('http')) {
+      try { link = new URL(link, baseUrl).href; } catch (_) {}
+    }
+
+    home = $el.find('.AF_FTeam .AF_TeamName, .AF_Team.AF_FTeam .AF_TeamName').first().text().replace(/\s+/g, ' ').trim();
+    away = $el.find('.AF_STeam .AF_TeamName, .AF_Team.AF_STeam .AF_TeamName').first().text().replace(/\s+/g, ' ').trim();
+    homeLogo = resolveImgSrc($el.find('.AF_FTeam img, .AF_Team.AF_FTeam img').first(), baseUrl);
+    awayLogo = resolveImgSrc($el.find('.AF_STeam img, .AF_Team.AF_STeam img').first(), baseUrl);
+
+    const results = $el.find('.AF_EventResult > span.result, span.result')
+      .map((_, s) => cheerio(s).text().trim()).get().filter(t => /^\d+$/.test(t));
+    if (results.length >= 2) {
+      homeScore = parseInt(results[0], 10);
+      awayScore = parseInt(results[1], 10);
       score = `${homeScore}-${awayScore}`;
-    } else if (rawS && !/^vs$/i.test(rawS)) score = rawS;
+    }
+
+    statusText = $el.find('.AF_StaText, .AF_Timer').first().text().replace(/\s+/g, ' ').trim();
+    timeRaw = $el.find('.AF_EvTime').first().text().replace(/\s+/g, ' ').trim();
+    dataTs = null;
+    startAttr = $el.attr('data-start') || null;
+
+    // stable id from link slug or teams+date
+    if (link) {
+      const mm = link.match(/\/matches\/([^/?#]+)/);
+      if (mm) externalId = mm[1].slice(0, 80);
+    }
+  } else {
+    // legacy kooratv / sir-tv selectors (kept for fallback compatibility)
+    id = ($el.attr('id') || '').replace(/^m-/, '') || null;
+    link = $el.find('a').attr('href') || null;
+    if (link && !link.startsWith('http')) {
+      try { link = new URL(link, baseUrl).href; } catch (_) {}
+    }
+    home = $el.find('.TM1 .TM_Name').text().trim();
+    away = $el.find('.TM2 .TM_Name').text().trim();
+    homeLogo = resolveImgSrc($el.find('.TM1 img').first(), baseUrl);
+    awayLogo = resolveImgSrc($el.find('.TM2 img').first(), baseUrl);
+
+    const goalSpans = $el.find('.MT_Result .RS-goals, .MT_Result .goals')
+      .map((_, s) => cheerio(s).text().trim()).get().filter(t => /^\d+$/.test(t));
+    if (goalSpans.length >= 2) {
+      homeScore = parseInt(goalSpans[0], 10);
+      awayScore = parseInt(goalSpans[1], 10);
+      score = `${homeScore}-${awayScore}`;
+    } else {
+      const rawS = $el.find('.MT_Result').text().replace(/\s+/g, ' ').trim();
+      const mscore = rawS.match(/(\d+)\s*[-–:]\s*(\d+)/);
+      if (mscore) {
+        homeScore = parseInt(mscore[1], 10);
+        awayScore = parseInt(mscore[2], 10);
+        score = `${homeScore}-${awayScore}`;
+      } else if (rawS && !/^vs$/i.test(rawS)) score = rawS;
+    }
+
+    statusText = $el.find('.MT_Stat').text().trim();
+    const $time = $el.find('.MT_Time').first();
+    timeRaw = $time.text().trim();
+    dataTs = $time.attr('data-ts') || $el.attr('data-ts') || null;
+    startAttr = $el.attr('data-start') || null;
+
+    if (link) {
+      const mm = link.match(/[?&]m=(\d+)/) || link.match(/\/match\/[^/]*?(\d{6,})/);
+      if (mm) externalId = mm[1];
+    }
   }
 
-  const statusText = $el.find('.MT_Stat').text().trim();
-  const $time = $el.find('.MT_Time').first();
-  const timeRaw = $time.text().trim();
-  const dataTs = $time.attr('data-ts') || $el.attr('data-ts') || null;
-  const isLiveClass = $el.hasClass('live') || $el.hasClass('now');
+  const isLiveClass = $el.hasClass('live') || $el.hasClass('now') || $el.hasClass('AF_Live');
   const isFinishedClass = $el.hasClass('finished') || $el.hasClass('end');
-  const startAttr = $el.attr('data-start') || null;
-
-  let externalId = null;
-  if (link) {
-    const mm = link.match(/[?&]m=(\d+)/) || link.match(/\/match\/[^/]*?(\d{6,})/);
-    if (mm) externalId = mm[1];
-  }
 
   let statusType = 'upcoming';
   const s = (statusText || '').toLowerCase();
-  if (isLiveClass || /مباشر|live|شوط|دقيقة|توقف|جارية/.test(s)) statusType = 'live';
-  else if (isFinishedClass || /انتهت|انتهى|ft|نهاية|full.?time/.test(s)) statusType = 'finished';
+  if (isLiveClass || /مباشر|live|شوط|دقيقة|توقف|جارية|الآن|now/.test(s)) statusType = 'live';
+  else if (isFinishedClass || /انتهت|انتهى|إنتهـــت|ft|نهاية|full.?time|انته/.test(s)) statusType = 'finished';
 
-  const info = parseMtInfo($el);
-  const cardBroadcast = broadcastMetaFromHtml($el.html());
-  const channel = normalizeChannel(info.channel || cardBroadcast.channel || null);
-  const commentator = info.commentator || cardBroadcast.commentator || null;
-  const competition = info.competition || null;
+  // Broadcast meta
+  let channel = null, commentator = null, competition = null;
+  if (isLiveTv) {
+    const ft = parseLiveTvFooter($el);
+    channel = normalizeChannel(ft.channel);
+    commentator = ft.commentator;
+    competition = ft.competition;
+  } else {
+    const info = parseMtInfo($el);
+    const cardBroadcast = typeof broadcastMetaFromHtml === 'function' ? broadcastMetaFromHtml($el.html()) : {};
+    channel = normalizeChannel(info.channel || cardBroadcast.channel || null);
+    commentator = info.commentator || cardBroadcast.commentator || null;
+    competition = info.competition || null;
+  }
 
-  // Prefer data-ts (epoch ms) from kooratv — most accurate
+  // Time: prefer data-start="YYYY-MM-DD HH:MM" (Cairo wall time on live-tvhd)
   let startMs = null, startHow = null;
   if (dataTs && /^\d{10,13}$/.test(String(dataTs))) {
     const n = Number(dataTs);
     startMs = n < 1e12 ? n * 1000 : n;
     startHow = 'data-ts';
+  } else if (startAttr && /^\d{4}-\d{2}-\d{2}\s+\d{1,2}:\d{2}/.test(startAttr)) {
+    // Cairo local time → convert to UTC ms using wallToUtc helpers
+    const m = startAttr.match(/^(\d{4})-(\d{2})-(\d{2})\s+(\d{1,2}):(\d{2})/);
+    if (m) {
+      const y = +m[1], mo = +m[2], d = +m[3], h = +m[4], mi = +m[5];
+      startMs = wallToUtc(y, mo, d, h, mi);
+      startHow = 'data-start-cairo';
+    }
   } else {
     const st = parseStart(startAttr, timeRaw, statusType);
     startMs = st ? st.ms + START_ADJUST_MIN * 60000 : null;
     startHow = st ? st.how : null;
   }
 
-  const hasStream = !!(link && (
-    /kooratv\.quest|sir-tv|sirtv|yallamo|match\//i.test(link) ||
-    link.includes('korat') || link.includes('hes-goals') || /[?&]m=\d+/.test(link) || link.includes('watch-')
-  ));
+  // hasStream: only if we have a public match page link (no hidden stream scraping)
+  const hasStream = !!(link && /\/matches\//i.test(link));
 
   if (!home || !away) return null;
-  const key = String(externalId || id || link || `${home}-${away}`);
+
+  const key = String(externalId || id || `${home}|${away}|${startAttr || timeRaw || ''}`).slice(0, 120);
+
   return {
     key, id, externalId, home, away, homeLogo, awayLogo, score,
     homeScore, awayScore,
@@ -369,47 +407,91 @@ function parseMatchCard($el, baseUrl) {
     startMs: startMs || null,
     startHow,
     channel, commentator,
-    commentatorPhoto: cardBroadcast.commentatorPhoto || null,
+    commentatorPhoto: null,
     competition, leagueName: competition,
-    link, hasStream, sourceSite: /kooratv/i.test(baseUrl) ? 'kooratv' : 'sirtv'
+    link, hasStream,
+    sourceSite: 'livetv-hd'
   };
 }
+
 async function scrapeSource(url) {
   const { data } = await get(url, { headers: { Referer: url, 'Cache-Control': 'no-cache' } });
   const $ = cheerio.load(data);
   const matches = [];
   const raw = [];
-  $('.AY_Match').each((_, el) => {
+
+  // Primary: live-tvhd AF_Match cards
+  $('.AF_Match').each((_, el) => {
     const m = parseMatchCard($(el), url);
     if (!m) return;
     matches.push(m);
-    if (raw.length < 15) raw.push({
+    if (raw.length < 20) raw.push({
       home: m.home, away: m.away, timeRaw: m.timeRaw, startHow: m.startHow,
-      startIso: m.start, cairo: m.time, channel: m.channel, competition: m.competition
+      startIso: m.start, cairo: m.time, channel: m.channel, competition: m.competition,
+      statusType: m.statusType, score: m.score
     });
   });
+
+  // Fallback legacy selectors if no AF_Match found
+  if (!matches.length) {
+    $('.AY_Match, .match-item, .match_item').each((_, el) => {
+      const m = parseMatchCard($(el), url);
+      if (!m) return;
+      matches.push(m);
+      if (raw.length < 15) raw.push({
+        home: m.home, away: m.away, timeRaw: m.timeRaw, startHow: m.startHow,
+        startIso: m.start, cairo: m.time, channel: m.channel, competition: m.competition
+      });
+    });
+  }
+
   return { matches, raw, html: data };
 }
+
 async function fetchMatches() {
+  if (scrapingLock) {
+    console.log('[Scraper] already running, skip concurrent');
+    return cache;
+  }
+  scrapingLock = true;
   try {
     let matches = [], raw = [], used = SOURCE;
     try {
       const r = await scrapeSource(SOURCE);
       matches = r.matches; raw = r.raw; used = SOURCE;
+      lastScrapeError = null;
     } catch (e1) {
       console.error('[Scraper primary]', e1.message);
+      lastScrapeError = e1.message;
       if (SOURCE_FALLBACK && SOURCE_FALLBACK !== SOURCE) {
-        const r2 = await scrapeSource(SOURCE_FALLBACK);
-        matches = r2.matches; raw = r2.raw; used = SOURCE_FALLBACK;
-      } else throw e1;
+        try {
+          const r2 = await scrapeSource(SOURCE_FALLBACK);
+          matches = r2.matches; raw = r2.raw; used = SOURCE_FALLBACK;
+          lastScrapeError = null;
+        } catch (e2) {
+          lastScrapeError = e2.message;
+          throw e1;
+        }
+      } else {
+        // keep previous cache on temporary failure
+        if (cache.matches && cache.matches.length) {
+          console.warn('[Scraper] keep previous cache after error:', e1.message);
+          cache.error = e1.message;
+          cache.lastUpdate = new Date().toISOString();
+          return cache;
+        }
+        throw e1;
+      }
     }
-    // Deduplicate by teams key
+
+    // Deduplicate by teams + approximate start
     const tk = (h, a) => `${String(h || '').trim()}|${String(a || '').trim()}`.toLowerCase();
     const seen = new Set();
     matches = matches.filter(m => {
-      const k = tk(m.home, m.away) + '|' + (m.startMs || '');
+      const k = tk(m.home, m.away) + '|' + Math.floor((m.startMs || 0) / 60000);
       if (seen.has(k)) return false;
-      seen.add(k); return true;
+      seen.add(k);
+      return true;
     });
     lastRaw = raw;
 
@@ -425,17 +507,20 @@ async function fetchMatches() {
       counts: { total: matches.length, live: live.length, finished: finished.length, upcoming: upcoming.length },
       lastUpdate: new Date().toISOString(), error: null, version: VERSION, tz: TZ, source: used
     };
-    console.log(`[Scraper] source=${used} total=${matches.length} live=${live.length}`);
+    console.log(`[Scraper] source=${used} total=${matches.length} live=${live.length} upcoming=${upcoming.length} finished=${finished.length}`);
     resolveInBackground(matches);
     return cache;
   } catch (err) {
     console.error('[Scraper]', err.message);
+    lastScrapeError = err.message;
     cache.error = err.message;
     cache.lastUpdate = new Date().toISOString();
+    // never return empty list if we had data
     return cache;
+  } finally {
+    scrapingLock = false;
   }
 }
-
 
 function emptyDetails() {
   return {
@@ -1085,17 +1170,8 @@ async function fetchMatchPlayerEmbed(matchLink) {
       }
       return { embed, servers, sport };
     }
-    // لو مفيش embed صريح — جرّب sport-1 كافتراضي مع السيرفرات
-    const fallback = `${YALLA_PLAYER_BASE}/sport-1/`;
-    return {
-      embed: fallback,
-      servers: Array.from({ length: 6 }, (_, i) => ({
-        label: i === 0 ? 'البث الرئيسي' : `بث ${i + 1}`,
-        embed: `${YALLA_PLAYER_BASE}/sport-1/?serv=${i + 1}`
-      })),
-      sport: 1,
-      guessed: true
-    };
+    // لا نخمّن روابط yalla تلقائياً لمصدر live-tvhd — فقط الروابط المعلنة أو اليدوية من اللوحة
+    return null;
   } catch (e) {
     console.error('[fetchMatchPlayerEmbed]', e.message);
     return null;
@@ -3203,6 +3279,30 @@ setInterval(loadManualFromFirebase, 30 * 1000);
 loadManualFromFirebase();
 
 // ========== ROUTES ==========
+
+app.get('/api/source-status', (req, res) => {
+  const c = cache || {};
+  res.json({
+    success: true,
+    source: c.source || SOURCE,
+    sourcePrimary: SOURCE,
+    sourceFallback: SOURCE_FALLBACK || null,
+    lastUpdate: c.lastUpdate || null,
+    error: c.error || lastScrapeError || null,
+    version: VERSION,
+    counts: c.counts || { total: 0, live: 0, finished: 0, upcoming: 0 },
+    total: (c.matches || []).length,
+    live: (c.live || []).length,
+    upcoming: (c.upcoming || []).length,
+    finished: (c.finished || []).length,
+    scrapingLock: typeof scrapingLock !== 'undefined' ? scrapingLock : false,
+    sample: (c.matches || []).slice(0, 3).map(m => ({
+      home: m.home, away: m.away, statusType: m.statusType, time: m.time,
+      channel: m.channel, competition: m.competition, start: m.start
+    }))
+  });
+});
+
 app.get('/api/matches', (req, res) => res.json({ success: true, ...cache }));
 
 // قائمة القنوات الناقلة اليوم (مجمّعة من المباريات)
@@ -3628,6 +3728,7 @@ app.get('/', (req, res) => {
     ],
     endpoints: {
       matches: 'GET /api/matches',
+      sourceStatus: 'GET /api/source-status',
       leagues: 'GET /api/leagues',
       league: 'GET /api/league/:id',
       leagueGroups: 'GET /api/league/:id/groups',
